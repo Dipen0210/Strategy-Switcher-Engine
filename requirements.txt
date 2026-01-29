@@ -17,3 +17,10 @@ plotly
 
 # Utility
 tqdm
+
+# SUP Flow 1 - ML Components
+hmmlearn>=0.3.0    # Gaussian HMM for regime detection
+arch>=6.0          # GARCH volatility modeling
+
+# Testing
+pytest>=7.0.0

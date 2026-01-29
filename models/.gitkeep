@@ -1,0 +1,4 @@
+# models/.gitkeep
+# This directory stores trained HMM models
+# Files are named: {TICKER}_hmm.pkl
+# Example: AAPL_hmm.pkl, MSFT_hmm.pkl
