@@ -58,7 +58,7 @@ def volatility_adjusted_sizing(
     raw_weights: pd.Series,
     forecast_vol: pd.Series,
     target_vol: float = 0.15,
-    max_position: float = 0.25,
+    max_position: float = 1.0,  # Changed from 0.25 to 1.0 to respect user weights
     min_position: float = 0.01,
 ) -> pd.Series:
     """

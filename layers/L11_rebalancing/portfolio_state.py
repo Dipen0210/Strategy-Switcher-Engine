@@ -61,7 +61,10 @@ class PortfolioState:
     initial_capital: Optional[float] = None
     realized_pnl: float = 0.0
     unrealized_pnl: float = 0.0
+    realized_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
     fees_paid: float = 0.0
+    peak_equity: float = 0.0  # Tracks High Water Mark for Kill Switch
     
     portfolio_value_history: pd.DataFrame = field(
         default_factory=lambda: pd.DataFrame(
@@ -181,6 +184,11 @@ class PortfolioState:
         self.unrealized_pnl = float(sum(unrealized_components))
         
         total_value = holdings_value + self.cash
+        
+        # Update High Water Mark
+        if total_value > self.peak_equity:
+            self.peak_equity = total_value
+            
         normalized_date = _normalize_date(date)
         
         self.portfolio_value_history.loc[len(self.portfolio_value_history)] = [

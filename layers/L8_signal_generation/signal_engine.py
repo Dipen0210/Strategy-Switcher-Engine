@@ -21,12 +21,11 @@ Signal Types:
 - BUY: New position entry
 - SELL: Full position exit (removed from portfolio)
 - REBALANCE: Weight adjustment (same strategy)
-- LIQUIDATE: Full exit before strategy change re-entry
 - HOLD: No action needed
 
 Strategy-Aware Logic:
 - Same strategy → REBALANCE (adjust weights only)
-- Strategy changed → LIQUIDATE + BUY (exit old, enter new at current price)
+- Strategy changed → SELL + BUY (exit old, enter new at current price)
 """
 
 from __future__ import annotations

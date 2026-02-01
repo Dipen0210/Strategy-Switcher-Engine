@@ -17,8 +17,9 @@ def log_cycle_summary(
     rebalance_frequency: str,
     portfolio_value: float,
     cash: float,
-    pnl: float = 0.0,
-    return_pct: float = 0.0,
+    initial_capital: float,  # New Required Argument
+    pnl: float = 0.0,        # Deprecated, calculated internally
+    return_pct: float = 0.0, # Deprecated, calculated internally
     cycle_number: int = 1,
     realized_pnl: float = 0.0,
     unrealized_pnl: float = 0.0,
@@ -27,55 +28,32 @@ def log_cycle_summary(
     num_positions: int = 0,
 ) -> pd.DataFrame:
     """
-    Log a rebalance cycle summary.
-    
-    Parameters
-    ----------
-    execution_date : str
-        Date of the rebalance
-    rebalance_frequency : str
-        Frequency setting (Daily, Weekly, Monthly)
-    portfolio_value : float
-        Total portfolio value at cycle end
-    cash : float
-        Cash balance at cycle end
-    pnl : float
-        Period P/L
-    return_pct : float
-        Period return percentage
-    cycle_number : int
-        Rebalance cycle number
-    realized_pnl : float
-        Realized P/L from closed positions
-    unrealized_pnl : float
-        Unrealized P/L from open positions
-    cumulative_realized_pnl : float
-        Cumulative realized P/L
-    transaction_costs : float
-        Total transaction costs this cycle
-    num_positions : int
-        Number of positions held
-        
-    Returns
-    -------
-    pd.DataFrame
-        The cycle summary record
+    Log a rebalance cycle summary with strict accounting enforcement.
+    P/L = (Current Holdings + Cash) - Initial Capital.
     """
     os.makedirs("logs", exist_ok=True)
+    
+    # STRICT ACCOUNTING IDENTITY CHECK
+    # Note: portfolio_value passed from pipeline IS Total Equity (Holdings + Cash)
+    total_value = portfolio_value
+    actual_pnl = total_value - initial_capital
+    actual_return_pct = (actual_pnl / initial_capital * 100) if initial_capital > 0 else 0.0
     
     record = {
         "Execution_Date": execution_date,
         "Rebalance_Cadence": f"{rebalance_frequency} Rebalance",
-        "Current_Position": round(portfolio_value, 4),
-        "P/L": round(pnl, 4),
-        "Return_%": f"{return_pct:.4f}%",
+        "Current_Position": round(total_value, 4), # This serves as Total Equity
+        "Cash": round(cash, 4),
+        "Total_Value": round(total_value, 4),
+        "Initial_Capital": round(initial_capital, 4),
+        "P/L": round(actual_pnl, 4),
+        "Return_%": f"{actual_return_pct:.4f}%",
         "Rebalances": cycle_number,
         "Realized_P/L": round(realized_pnl, 4),
         "Cumulative_Realized_P/L": round(cumulative_realized_pnl, 4),
         "Unrealized_P/L": round(unrealized_pnl, 4),
         "Latest_Unrealized_P/L": round(unrealized_pnl, 4),
         "Transaction_Costs": round(transaction_costs, 4),
-        "Cash": round(cash, 4),
         "Num_Positions": num_positions,
         "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -85,6 +63,12 @@ def log_cycle_summary(
     # Append to existing log
     if os.path.exists(LOG_PATH):
         existing = pd.read_csv(LOG_PATH)
+        # Ensure new columns exist in old CSV
+        if "Total_Value" not in existing.columns:
+            existing["Total_Value"] = existing["Current_Position"] + existing.get("Cash", 0)
+        if "Initial_Capital" not in existing.columns:
+            existing["Initial_Capital"] = 10000.0 # fallback
+            
         combined = pd.concat([existing, record_df], ignore_index=True)
     else:
         combined = record_df

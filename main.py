@@ -35,6 +35,18 @@ st.set_page_config(
     layout="wide"
 )
 
+# ---------------------------------------------------------
+# Auto-Reset Logs on Page Refresh (New Session)
+# ---------------------------------------------------------
+if "session_initialized" not in st.session_state:
+    # This block runs only once when the user opens/refreshes the page
+    clear_cycle_log()
+    clear_transaction_log()
+    clear_signal_log()
+    st.session_state.session_initialized = True
+    # Initial clear feedback (optional, logging to console)
+    print("Logs cleared for new session.")
+
 st.title("🎯 Strategy Engine")
 st.caption("Automated strategy switching with HMM regime detection")
 
@@ -134,11 +146,22 @@ button_label = "🚀 Run Strategy" if is_first_run else "🔄 Rebalance (Next Cy
 button_type = "primary" if is_first_run else "secondary"
 
 if st.sidebar.button(button_label, use_container_width=True, type=button_type):
+    # 0. Validate Allocation (Must be 100%)
+    # Read from the authoritative user_weights dict
+    if "user_weights" in st.session_state and st.session_state.user_weights:
+        current_total = sum(st.session_state.user_weights.values())
+        
+        if abs(current_total - 100.0) > 0.1:
+            st.sidebar.error(f"⚠️ Total Allocation is {current_total:.1f}%!")
+            st.sidebar.error("Must be 100%. Please check 'Allocation' tab.")
+            st.stop()
+
     today = date.today()
     
     if st.session_state.current_as_of_date is None:
-        # FIRST RUN: Use selected "As of Date"
-        st.session_state.current_as_of_date = analysis_date
+        # FIRST RUN: Use selected "As of Date" (Execution Date)
+        # Fix: Start on the actual trading day (e.g., Monday 12th), not the data day (Friday 9th)
+        st.session_state.current_as_of_date = execution_date
         st.session_state.run_requested = True
     else:
         # REBALANCE: Advance date
@@ -196,43 +219,49 @@ with tab_allocation:
     # Create columns for sliders
     cols = st.columns(min(len(tickers), 3))
     
-    weights = {}
-    total_allocated = 0.0
+    # =======================================================
+    # WEIGHT STORAGE: Use a dedicated session state dict
+    # =======================================================
+    if "user_weights" not in st.session_state:
+        st.session_state.user_weights = {}
     
+    # Initialize defaults for any new tickers
+    default_per_stock = 100.0 / len(tickers) if tickers else 0.0
+    for ticker in tickers:
+        if ticker not in st.session_state.user_weights:
+            st.session_state.user_weights[ticker] = default_per_stock
+    
+    # Remove weights for deselected tickers
+    current_tickers = set(tickers)
+    stored_tickers = set(st.session_state.user_weights.keys())
+    for old_ticker in stored_tickers - current_tickers:
+        del st.session_state.user_weights[old_ticker]
+    
+    # Callback function for slider changes
+    def update_weight(ticker):
+        key = f"slider_{ticker}"
+        if key in st.session_state:
+            st.session_state.user_weights[ticker] = st.session_state[key]
+    
+    # Render sliders with callbacks
     for i, ticker in enumerate(tickers):
-        remaining = float(max(0, 100 - total_allocated))
         col_idx = i % 3
-        
         with cols[col_idx]:
-            if i == len(tickers) - 1:
-                # Last ticker gets remaining allocation
-                weights[ticker] = remaining
-                st.metric(
-                    f"{ticker}",
-                    f"{remaining:.0f}%",
-                    help=f"{AVAILABLE_STOCKS[ticker]} - Auto-calculated"
-                )
-            elif remaining < 5.0:
-                # Not enough remaining for meaningful slider - show as 0%
-                weights[ticker] = 0.0
-                st.metric(
-                    f"{ticker}",
-                    "0%",
-                    help=f"{AVAILABLE_STOCKS[ticker]} - No allocation remaining"
-                )
-            else:
-                # Normal slider
-                default = float(min(100.0 / len(tickers), remaining))
-                w = st.slider(
-                    f"{ticker} - {AVAILABLE_STOCKS[ticker]}",
-                    min_value=0.0,
-                    max_value=remaining,
-                    value=default,
-                    step=5.0,
-                    key=f"alloc_{ticker}"
-                )
-                weights[ticker] = w
-                total_allocated += w
+            st.slider(
+                f"{ticker} - {AVAILABLE_STOCKS.get(ticker, ticker)}",
+                min_value=0.0,
+                max_value=100.0,
+                value=st.session_state.user_weights[ticker],
+                step=1.0,
+                key=f"slider_{ticker}",
+                on_change=update_weight,
+                args=(ticker,),
+                help="Target allocation %"
+            )
+    
+    # Read weights from the authoritative source
+    weights = st.session_state.user_weights.copy()
+    total_allocated = sum(weights.values())
     
     st.divider()
     
@@ -242,9 +271,20 @@ with tab_allocation:
     with col1:
         total = sum(weights.values())
         if abs(total - 100) < 0.1:
-            st.success(f"✅ Total Allocation: {total:.0f}%")
+            st.success(f"✅ Total: {total:.0f}%")
         else:
-            st.warning(f"⚠️ Total: {total:.1f}%")
+            st.error(f"⚠️ Total: {total:.1f}% (Must be 100%)")
+            if total > 0:
+                if st.button("⚖️ Auto-Normalize to 100%"):
+                    factor = 100.0 / total
+                    for t in tickers:
+                        # Update session state for next rerun
+                        key = f"weight_v2_{t}"
+                        if key in st.session_state:
+                            st.session_state[key] = st.session_state[key] * factor
+                    st.rerun()
+            else:
+                st.error("Please allocate weights.")
         
         st.metric("Total Capital", f"${capital:,.0f}")
         
@@ -305,7 +345,17 @@ with tab_allocation:
             action = "Rebalancing" if is_rebalance else "Running Strategy Engine"
             with st.spinner(f"{action}..."):
                 try:
-                    weight_list = [weights[t] / 100.0 for t in tickers]
+                    # RE-FETCH weights from session state to ensure fresh inputs
+                    # NOW READING STRICTLY FROM THE 'user_weights' DICT
+                    current_weights = []
+                    
+                    # Ensure we iterate in the same order as 'tickers' passed to create_policy
+                    for t in tickers:
+                        # Default to 0 if not found (should be caught by 100% check earlier)
+                        w = st.session_state.user_weights.get(t, 0.0)
+                        current_weights.append(w / 100.0)
+                    
+                    weight_list = current_weights
                     
                     # Create policy
                     policy = create_policy(
@@ -327,9 +377,14 @@ with tab_allocation:
                         engine.policy = policy
                     
                     # Run the engine
+                    # Pipeline calculates execution as T+1 from 'current_date'.
+                    # User picked 'run_date' as the EXECUTION date.
+                    # So we pass T-1 to the pipeline.
+                    pipeline_input_date = previous_trading_day(run_date)
+                    
                     result = st.session_state.strategy_engine.run(
                         stock_data, 
-                        current_date=run_date.strftime("%Y-%m-%d")
+                        current_date=pipeline_input_date.strftime("%Y-%m-%d")
                     )
                     
                     st.session_state.result = result
@@ -372,24 +427,9 @@ with tab_strategy:
         
         st.divider()
         
-        col1, col2 = st.columns(2)
+        st.divider()
+        st.info("ℹ️ Strategy selection, filtering, and scoring is performed independently for each stock based on its regime.")
         
-        with col1:
-            st.subheader("✅ Allowed Strategies")
-            if result.allowed_strategies:
-                for s in result.allowed_strategies:
-                    score = result.bandit_scores.get(s, 0)
-                    st.write(f"- **{s}** (ML score: {score:.3f})")
-            else:
-                st.info("No strategies available")
-        
-        with col2:
-            st.subheader("❌ Filtered Out")
-            if result.removed_strategies:
-                for s in result.removed_strategies:
-                    st.write(f"- {s}")
-            else:
-                st.info("No strategies filtered")
         
         # Per-stock strategy assignment table
         if result.per_stock_strategies:
@@ -400,10 +440,20 @@ with tab_strategy:
             for ticker, strategy in result.per_stock_strategies.items():
                 regime_info = result.regime_output.get(ticker, {})
                 regime = regime_info.get("dominant_regime", "Unknown") if isinstance(regime_info, dict) else "Unknown"
+                
+                # Fetch details
+                details = getattr(result, "per_stock_details", {}).get(ticker, {})
+                allowed = details.get("allowed", [])
+                removed = details.get("removed", [])
+                scores = details.get("scores", {})
+                current_score = scores.get(strategy, 0.0)
+                
                 strategy_data.append({
                     "Ticker": ticker,
                     "Regime": regime,
-                    "Strategy": strategy,
+                    "Selected Strategy": f"{strategy} ({current_score:.3f})",
+                    "Allowed Strategies": ", ".join(allowed),
+                    "Filtered Out": ", ".join(removed)
                 })
             
             strategy_df = pd.DataFrame(strategy_data)
@@ -461,22 +511,52 @@ with tab_positions:
             pos_df = result.position_sizes.copy()
             
             # Format display
+            # Format display
             display_df = pos_df.copy()
-            for col in ["User_Weight", "Adjusted_Weight"]:
+            
+            # Explicit rename for user clarity
+            rename_map = {
+                "User_Weight": "Your Input",
+                "Adjusted_Weight": "Volatility Sized",
+                "Capital_Allocation": "Final $ Allocation"
+            }
+            display_df = display_df.rename(columns=rename_map)
+            
+            # Format percentages and currency
+            for col in ["Your Input", "Volatility Sized"]:
                 if col in display_df.columns:
                     display_df[col] = display_df[col].apply(lambda x: f"{x:.1%}")
-            if "Capital_Allocation" in display_df.columns:
-                display_df["Capital_Allocation"] = display_df["Capital_Allocation"].apply(lambda x: f"${x:,.2f}")
+            if "Final $ Allocation" in display_df.columns:
+                display_df["Final $ Allocation"] = display_df["Final $ Allocation"].apply(lambda x: f"${x:,.2f}")
             
             st.dataframe(display_df, hide_index=True, use_container_width=True)
             
-            if "Ticker" in pos_df.columns and "Adjusted_Weight" in pos_df.columns:
-                fig = px.pie(
-                    pos_df,
-                    names="Ticker",
-                    values="Adjusted_Weight",
-                    title="Risk-Adjusted Portfolio Allocation",
-                    hole=0.4
+            st.divider()
+            st.subheader("⚖️ Sizing Impact: Input vs. Risk-Adjusted")
+            
+            # Comparison Chart
+            if "Ticker" in pos_df.columns:
+                # Melt for grouped bar chart
+                chart_data = pos_df.melt(
+                    id_vars=["Ticker"], 
+                    value_vars=["User_Weight", "Adjusted_Weight"],
+                    var_name="Type",
+                    value_name="Weight"
+                )
+                chart_data["Type"] = chart_data["Type"].map({
+                    "User_Weight": "Your Input", 
+                    "Adjusted_Weight": "Volatility Sized"
+                })
+                
+                fig = px.bar(
+                    chart_data,
+                    x="Ticker",
+                    y="Weight",
+                    color="Type",
+                    barmode="group",
+                    title="Comparison: User Intent vs. Risk Sizing",
+                    text_auto=".1%",
+                    color_discrete_map={"Your Input": "#3366CC", "Volatility Sized": "#DC3912"}
                 )
                 st.plotly_chart(fig, use_container_width=True)
         else:

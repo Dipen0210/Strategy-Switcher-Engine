@@ -143,6 +143,7 @@ def create_policy(
     total_capital: float = 10000.0,
     risk_tolerance: RiskTolerance = "Medium",
     rebalance_frequency: RebalanceFrequency = "Weekly",
+    emergency_drawdown_threshold: float = 0.20,
 ) -> UserPolicy:
     """
     Factory function to create a UserPolicy.
@@ -174,4 +175,5 @@ def create_policy(
         assets=assets,
         total_capital=total_capital,
         rebalance_frequency=rebalance_frequency,
+        emergency_drawdown_threshold=emergency_drawdown_threshold,
     )

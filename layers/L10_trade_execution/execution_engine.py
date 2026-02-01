@@ -129,18 +129,7 @@ def reconcile_orders_from_signals(
         
         current_qty = state.positions.get(ticker, 0.0)
         
-        if signal_type == "LIQUIDATE":
-            # Full exit of position
-            if current_qty > 1e-8:
-                orders.append({
-                    "Ticker": ticker,
-                    "Side": "SELL",
-                    "Qty": current_qty,
-                    "Signal": "LIQUIDATE",
-                    "Strategy": new_strategy,
-                })
-                
-        elif signal_type == "SELL":
+        if signal_type == "SELL":
             # Full exit (removed from portfolio)
             if current_qty > 1e-8:
                 orders.append({

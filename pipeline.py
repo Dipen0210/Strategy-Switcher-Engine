@@ -26,6 +26,7 @@ from typing import Optional, Dict, List
 
 import pandas as pd
 import numpy as np
+from utils.trading_calendar import next_trading_day
 
 # Layer imports (New Structure)
 from layers.L0_user_policy import UserPolicy, create_policy, RISK_LIMITS
@@ -45,15 +46,15 @@ from layers.L12_performance_benchmark import PerformanceMonitor, DecisionExplana
 
 def get_next_trading_day(date_str: str) -> str:
     """
-    Get next trading day (skip weekends).
+    Get next trading day using robust calendar (skips weekends + holidays).
     Signal generation happens on Day T closing, execution on Day T+1 opening.
     """
     dt = datetime.strptime(date_str, "%Y-%m-%d")
-    next_day = dt + timedelta(days=1)
-    # Skip weekends (Sat=5, Sun=6)
-    while next_day.weekday() >= 5:
-        next_day += timedelta(days=1)
-    return next_day.strftime("%Y-%m-%d")
+    # Start search from tomorrow (T+1)
+    start_search = dt + timedelta(days=1)
+    # Find next valid business day on or after T+1
+    valid_next = next_trading_day(start_search)
+    return valid_next.strftime("%Y-%m-%d")
 
 
 @dataclass
@@ -67,6 +68,7 @@ class PipelineResult:
     removed_strategies: List[str]
     bandit_scores: Dict[str, float]
     per_stock_strategies: Dict[str, str] = None  # Ticker → Strategy (per-stock selection)
+    per_stock_details: Dict[str, dict] = None    # Ticker → {allowed, removed, scores}
     position_sizes: Optional[pd.DataFrame] = None
     signals_df: Optional[pd.DataFrame] = None  # Layer 8 trade signals
     execution_report: Optional[dict] = None
@@ -95,6 +97,10 @@ class StrategyEngine:
         self.monitor = PerformanceMonitor()                     # L12
         
         self.current_strategy: Optional[str] = None
+        
+        # Learning State (Persists across rebalances)
+        self.last_decisions: Dict[str, str] = {}    # Ticker → Strategy Name
+        self.last_contexts: Dict[str, np.ndarray] = {}  # Ticker → Context Vector
     
     def set_policy(self, policy: UserPolicy) -> None:
         self.policy = policy
@@ -124,9 +130,49 @@ class StrategyEngine:
         for ticker, df in stock_data_dict.items():
             if df is not None and not df.empty:
                 enriched_data[ticker] = compute_all_features(df)
+                
+        # === 0.5 EMERGENCY KILL SWITCH ===
+        # Independent check before any strategy logic
+        current_equity = self.portfolio_state.current_equity(
+            snapshot_prices(stock_data_dict, current_date_str)
+        )
+        peak_equity = self.portfolio_state.peak_equity
         
-        # === 2. REGIME INTELLIGENCE ===
-        regime_outputs = {}
+        # Calculate Drawdown from High Water Mark
+        current_drawdown = 0.0
+        if peak_equity > 0:
+            current_drawdown = (peak_equity - current_equity) / peak_equity
+            
+        emergency_triggered = False
+        if current_drawdown > self.policy.emergency_drawdown_threshold:
+            emergency_triggered = True
+            print(f"!!! KILL SWITCH TRIGGERED !!! Drawdown {current_drawdown:.2%} > Limit {self.policy.emergency_drawdown_threshold:.2%}")
+            
+            # Force Liquidation
+            selected_strategy = "EMERGENCY_EXIT"
+            dominant_regime = "CRISIS"
+            regime_outputs = {}
+            allowed_strategies = ["Defensive"]
+            removed_strategies = ["ALL_OTHERS"]
+            bandit_scores = {}
+            per_stock_strategies = {t: "Defensive" for t in stock_data_dict.keys()}
+            per_stock_details = {}
+            
+            # Position Sizing -> Force 0 (Cash)
+            position_sizes = pd.Series({t: 0.0 for t in stock_data_dict.keys()})
+            switch_decision = SwitchDecision(
+                should_switch=True, reason="Emergency Protocol", 
+                current_strategy=self.current_strategy or "None",
+                new_strategy="EMERGENCY_EXIT", new_probability=1.0
+            ) 
+            strategy_decision = None # Special case
+            
+            # BYPASS REST OF LOGIC -> Jump to Signal Generation
+            # We mock the variables needed for Signal Generation
+            
+        else:
+            # === 2. REGIME INTELLIGENCE ===
+            regime_outputs = {}
         for ticker, df in enriched_data.items():
             try:
                 detector = self.regime_manager.get_or_create(ticker)
@@ -155,6 +201,7 @@ class StrategyEngine:
         # === 4-6. PER-STOCK STRATEGY SELECTION ===
         # Run filter → bandit → ranking for EACH stock based on its individual regime
         per_stock_strategies = {}
+        per_stock_details = {}
         per_stock_allowed = {}
         all_removed = set()
         risk_score_val = {"Low": 0.3, "Medium": 0.5, "High": 0.7}.get(risk_tolerance, 0.5)
@@ -182,7 +229,14 @@ class StrategyEngine:
             # L5: Bandit for THIS stock's context
             stock_data = enriched_data.get(ticker)
             if stock_data is not None and hasattr(stock_data, "columns"):
-                stock_vol = stock_data["Realized_Vol"].iloc[-1] if "Realized_Vol" in stock_data.columns else 0.15
+                # Use GARCH if available (Predictive), else Realized
+                if "GARCH_Vol" in stock_data.columns:
+                    stock_vol = stock_data["GARCH_Vol"].iloc[-1]
+                elif "Realized_Vol" in stock_data.columns:
+                    stock_vol = stock_data["Realized_Vol"].iloc[-1]
+                else:
+                    stock_vol = 0.15
+                    
                 stock_momentum = stock_data["Momentum"].iloc[-1] if "Momentum" in stock_data.columns else 0.0
                 stock_dd = stock_data["Drawdown"].iloc[-1] if "Drawdown" in stock_data.columns else 0.0
             else:
@@ -210,6 +264,19 @@ class StrategyEngine:
             )
             
             per_stock_strategies[ticker] = stock_decision.selected_strategy
+            
+            # Capture details for UI
+            per_stock_details[ticker] = {
+                "allowed": stock_allowed,
+                "removed": stock_removed,
+                "scores": stock_bandit_scores,
+            }
+            
+            # Save context for next update
+            self.last_contexts[ticker] = stock_context
+            
+        # Save decisions for next update
+        self.last_decisions = per_stock_strategies.copy()
         
         # Aggregate: most common strategy for display (fallback)
         if per_stock_strategies:
@@ -227,6 +294,7 @@ class StrategyEngine:
         removed_strategies = list(all_removed)
         
         # Create a summary decision object
+        # Create a summary decision object (for normal path)
         strategy_decision = select_best_strategy(
             allowed_strategies=allowed_strategies,
             bandit_scores=bandit_scores,
@@ -236,8 +304,8 @@ class StrategyEngine:
         # === 7. POSITION SIZING ===
         vol_series = pd.Series({
             ticker: (
-                data["Realized_Vol"].iloc[-1] if "Realized_Vol" in data.columns 
-                else 0.15
+                (data["GARCH_Vol"].iloc[-1] if "GARCH_Vol" in data.columns else data["Realized_Vol"].iloc[-1])
+                if "Realized_Vol" in data.columns else 0.15
             ) if hasattr(data, "columns") else 0.15
             for ticker, data in enriched_data.items()
         })
@@ -339,18 +407,24 @@ class StrategyEngine:
                 # Count positions with non-zero qty
                 num_positions = len(self.portfolio_state.positions)
                 
+                # Extract marginal fees from this execution only
+                fees_this_cycle = 0.0
+                if execution_report and "fees_paid" in execution_report:
+                    fees_this_cycle = execution_report["fees_paid"]
+
                 log_cycle_summary(
                     execution_date=execution_date_str,  # T+1 execution date
                     rebalance_frequency=self.policy.rebalance_frequency,
                     portfolio_value=portfolio_value,
                     cash=self.portfolio_state.cash,
+                    initial_capital=self.policy.total_capital,  # Pass strict initial capital
                     pnl=pnl,
                     return_pct=return_pct,
                     cycle_number=cycle_num,
                     realized_pnl=realized_pnl,
                     unrealized_pnl=unrealized_pnl,
-                    cumulative_realized_pnl=realized_pnl,  # Same as realized since we track cumulative
-                    transaction_costs=self.portfolio_state.fees_paid,
+                    cumulative_realized_pnl=realized_pnl,
+                    transaction_costs=fees_this_cycle,  # Log MARGINAL fees, not cumulative
                     num_positions=num_positions,
                 )
             except Exception as e:
@@ -391,6 +465,7 @@ class StrategyEngine:
             removed_strategies=removed_strategies,
             bandit_scores=bandit_scores,
             per_stock_strategies=per_stock_strategies,
+            per_stock_details=per_stock_details,
             position_sizes=position_sizes,
             signals_df=signals,
             execution_report=execution_report,
@@ -418,6 +493,44 @@ class StrategyEngine:
             if isinstance(df, pd.DataFrame) and "Momentum" in df.columns:
                 moms.append(df["Momentum"].iloc[-1])
         return np.mean(moms) if moms else 0.0
+
+    def _update_bandit(self, enriched_data: Dict[str, pd.DataFrame]):
+        """
+        Update bandit posteriors based on realized rewards from the previous cycle.
+        Reward = Risk-Adj Return (Sharpe) if position was held, else 0 (or penalty).
+        """
+        for ticker, strategy in self.last_decisions.items():
+            if ticker not in enriched_data: continue
+            
+            df = enriched_data[ticker]
+            if df.empty or "Returns" not in df.columns: continue
+            
+            # 1. Did we participate? (Check T-1 holdings)
+            # self.portfolio_state has holdings from START of this run (end of prev cycle)
+            qty = self.portfolio_state.positions.get(ticker, 0)
+            
+            # 2. Calculate Strategy Return
+            # If Qty > 0, we captured the market return (simplified)
+            # If Qty == 0, we got 0 return (Cash)
+            mkt_return = df["Returns"].iloc[-1]
+            mkt_vol = df["Realized_Vol"].iloc[-1] if "Realized_Vol" in df.columns else 0.15
+            mkt_dd = df["Max_Drawdown"].iloc[-1] if "Max_Drawdown" in df.columns else 0.0
+            
+            if abs(qty) > 0:
+                strategy_return = mkt_return
+            else:
+                strategy_return = 0.0
+            
+            # 3. Compute Bandit Reward
+            reward = self.bandit.compute_reward(
+                returns=strategy_return,
+                volatility=mkt_vol,
+                drawdown=mkt_dd
+            )
+            
+            # 4. Update
+            context = self.last_contexts.get(ticker)
+            self.bandit.update(strategy, reward, context)
 
     def _compute_avg_drawdown(self, enriched_data: dict) -> float:
         dds = []

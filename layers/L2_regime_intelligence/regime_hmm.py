@@ -96,8 +96,10 @@ class RegimeDetector:
             returns = np.log(df["Close"] / df["Close"].shift(1)).values
         features.append(returns)
         
-        # Realized volatility
-        if "Realized_Vol" in df.columns:
+        # Volatility (Prioritize GARCH > Realized > Calculated)
+        if "GARCH_Vol" in df.columns:
+            vol = df["GARCH_Vol"].values
+        elif "Realized_Vol" in df.columns:
             vol = df["Realized_Vol"].values
         else:
             log_ret = np.log(df["Close"] / df["Close"].shift(1))

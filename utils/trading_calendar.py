@@ -13,10 +13,17 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 import pandas as pd
-from pandas.tseries.holiday import USFederalHolidayCalendar
+from pandas.tseries.holiday import USFederalHolidayCalendar, GoodFriday
+
+class AugmentedTradingCalendar(USFederalHolidayCalendar):
+    """
+    Combines Federal Holidays (MLK, Presidents, etc.) with Market Holidays (Good Friday).
+    Inherits rules from USFederalHolidayCalendar and adds GoodFriday.
+    """
+    rules = USFederalHolidayCalendar.rules + [GoodFriday]
 
 # Singleton calendar instance
-US_HOLIDAY_CAL = USFederalHolidayCalendar()
+US_HOLIDAY_CAL = AugmentedTradingCalendar()
 
 
 def is_us_business_day(ts) -> bool:
