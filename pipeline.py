@@ -1,20 +1,19 @@
 """
-Strategy Engine — Core Pipeline Orchestrator (Refactored)
+Strategy Engine — Core Pipeline Orchestrator
 
-Implements the 13-layer flow (0-12):
-0. User & Policy
-1. Market Data & Features
-2. Regime Intelligence
-3. Strategy Universe
-4. Constraints Filter
-5. Global Bandit
-6. Deterministic Ranking
-7. Position Sizing
-8. Signal Generation
-9. Execution Scheduler
-10. Trade Execution
-11. Rebalancing
-12. Performance
+New Architecture:
+  PRE-MARKET (per stock):
+    1. HMM → regime posteriors
+    2. Bandit A: blend posteriors × trust → regime label
+    3. Confidence gate (> 0.55)
+    4. Load strategies for regime
+    5. Bandit B: rank strategies by Thompson sampling
+    6. Bandit C: evaluate top 3 for this stock → pick winner
+    7. Score = 0.5×θ_B + 0.3×HMM_conf + 0.2×stability
+  EXECUTE:
+    8. Position sizing + signal generation + trade execution
+  POST-MARKET:
+    9. Compute R_final, update all 3 bandits with differentiated rewards
 """
 
 from __future__ import annotations
@@ -28,20 +27,24 @@ import pandas as pd
 import numpy as np
 from utils.trading_calendar import next_trading_day
 
-# Layer imports (New Structure)
+# Layer imports
 from layers.L0_user_policy import UserPolicy, create_policy, RISK_LIMITS
 from layers.L1_data_features import compute_all_features
 from layers.L2_regime_intelligence import RegimeManager
-from layers.L3_strategy_universe import STRATEGY_REGISTRY, get_all_strategy_dicts
-from layers.L4_constraints_filter import apply_all_filters
-from layers.L5_global_bandit import ContextualBandit, OnlineLearner
-from layers.L6_deterministic_ranking import select_best_strategy, build_context_vector
+from layers.L2_regime_intelligence.regime_selection import (
+    blend_regime, compute_stability, REGIME_STRATEGY_COMPAT
+)
+from layers.L3_strategy_universe import STRATEGY_REGISTRY, get_all_strategy_dicts, get_strategies_for_regime, run_strategies_for_regime
 from layers.L7_position_sizing import compute_position_sizes
 from layers.L8_signal_generation import generate_portfolio_signals, log_signals
 from layers.L9_execution_scheduler import StrategySwitchManager
 from layers.L10_trade_execution import run_execution_cycle, log_transactions_from_fills, snapshot_prices
 from layers.L11_rebalancing import PortfolioState, log_cycle_summary, get_latest_cycle_number
 from layers.L12_performance_benchmark import PerformanceMonitor, DecisionExplanation
+
+# Hierarchical Bandit System (persistent across restarts)
+from layers.L5_bandit import BanditPersistenceManager
+from layers.L5_bandit.reward import compute_reward
 
 
 def get_next_trading_day(date_str: str) -> str:
@@ -87,20 +90,20 @@ class StrategyEngine:
         
         # State-persistent layers
         self.regime_manager = RegimeManager()                  # L2
-        strategy_names = list(STRATEGY_REGISTRY.keys())
-        self.bandit = ContextualBandit(strategy_names)         # L5
-        self.learner = OnlineLearner(self.bandit)              # L5 (Learning Loop)
         self.switch_manager = StrategySwitchManager()          # L9
         # Initialize with policy capital, or default to 10K if no policy
         initial_capital = policy.total_capital if policy else 10_000.0
         self.portfolio_state = PortfolioState(cash=initial_capital, initial_capital=initial_capital)  # L11 State
         self.monitor = PerformanceMonitor()                     # L12
         
+        # Hierarchical Bandit System (persistent across restarts)
+        self.ensemble_bandits = BanditPersistenceManager.load()  # L5 (Global + Regime + Stock)
+        
         self.current_strategy: Optional[str] = None
         
-        # Learning State (Persists across rebalances)
+        # Tracking for post-trade feedback
         self.last_decisions: Dict[str, str] = {}    # Ticker → Strategy Name
-        self.last_contexts: Dict[str, np.ndarray] = {}  # Ticker → Context Vector
+        self.last_regime: Optional[str] = None       # For transition detection
     
     def set_policy(self, policy: UserPolicy) -> None:
         self.policy = policy
@@ -130,6 +133,11 @@ class StrategyEngine:
         for ticker, df in stock_data_dict.items():
             if df is not None and not df.empty:
                 enriched_data[ticker] = compute_all_features(df)
+                
+        # === 1.5 POST-MARKET FEEDBACK (from previous cycle) ===
+        # Update bandits based on how our LAST decisions performed
+        if self.last_decisions:
+            self._update_bandit(enriched_data)
                 
         # === 0.5 EMERGENCY KILL SWITCH ===
         # Independent check before any strategy logic
@@ -167,139 +175,239 @@ class StrategyEngine:
             ) 
             strategy_decision = None # Special case
             
-            # BYPASS REST OF LOGIC -> Jump to Signal Generation
-            # We mock the variables needed for Signal Generation
-            
         else:
-            # === 2. REGIME INTELLIGENCE ===
+            # ==== PRE-MARKET: PER-STOCK FLOW ====
+            # Each stock gets its own HMM regime detection from its own data,
+            # blended with its own Bandit A trust weights.
+            
+            per_stock_strategies = {}
+            per_stock_details = {}
+            per_stock_allowed = {}
             regime_outputs = {}
-        for ticker, df in enriched_data.items():
-            try:
-                detector = self.regime_manager.get_or_create(ticker)
-                regime_out = detector.predict_regime(df)
+            all_removed = set()
+            
+            for ticker, df in enriched_data.items():
+                # === STEP 1: HMM → regime posteriors (per stock) ===
+                try:
+                    regime_output = self.regime_manager.predict_regime(ticker, df)
+                    hmm_posteriors = regime_output.probabilities
+                except Exception as e:
+                    print(f"  ⚠ HMM failed for {ticker}: {e}, fallback to Sideways")
+                    hmm_posteriors = {"Sideways": 1.0}
+                    regime_output = None
+                
+                # === STEP 2: BANDIT A — Blend posteriors × GLOBAL trust ===
+                # Get GLOBAL trust weights (learned from all stocks)
+                bandit_a_weights = self.ensemble_bandits.global_bandit.get_trust_weights()
+                blended = blend_regime(hmm_posteriors, bandit_a_weights)
+                
+                dominant_regime = max(blended, key=blended.get)
+                hmm_confidence = max(blended.values())
+                stability = regime_output.stability_score if regime_output else 0.5
+                
+                # Confidence gate
+                is_ambiguous = hmm_confidence < 0.55
+                if is_ambiguous:
+                    print(f"  ⚠ {ticker}: Ambiguous regime (confidence={hmm_confidence:.2f} < 0.55)")
+                
+                # Transition detection (per stock vs global last regime for now)
+                transition_flag = (
+                    self.last_regime is not None
+                    and dominant_regime != self.last_regime
+                )
+                
+                print(f"  📊 {ticker}: regime={dominant_regime} (conf={hmm_confidence:.1%}, stab={stability:.2f})")
+                
+                # Save regime output for UI
                 regime_outputs[ticker] = {
-                    "dominant_regime": regime_out.dominant_regime,
-                    "probabilities": regime_out.probabilities,
+                    "dominant_regime": dominant_regime,
+                    "probabilities": blended,
+                    "stability_score": stability,
+                    "hmm_confidence": hmm_confidence,
+                    "is_ambiguous": is_ambiguous,
+                    "transition_flag": transition_flag,
                 }
-            except Exception:
-                regime_outputs[ticker] = {
-                    "dominant_regime": "Range + Low Vol",
-                    "probabilities": {"Range + Low Vol": 1.0},
-                }
-        
-        # Aggregate regime
-        regime_counts = {}
-        for info in regime_outputs.values():
-            if isinstance(info, dict):
-                r = info.get("dominant_regime", "Range + Low Vol")
-                regime_counts[r] = regime_counts.get(r, 0) + 1
-        dominant_regime = max(regime_counts, key=regime_counts.get) if regime_counts else "Range + Low Vol"
-        
-        # === 3. STRATEGY UNIVERSE ===
-        all_strategies = get_all_strategy_dicts()
-        
-        # === 4-6. PER-STOCK STRATEGY SELECTION ===
-        # Run filter → bandit → ranking for EACH stock based on its individual regime
-        per_stock_strategies = {}
-        per_stock_details = {}
-        per_stock_allowed = {}
-        all_removed = set()
-        risk_score_val = {"Low": 0.3, "Medium": 0.5, "High": 0.7}.get(risk_tolerance, 0.5)
-        
-        for ticker in enriched_data.keys():
-            # Get this stock's regime
-            ticker_regime_info = regime_outputs.get(ticker, {})
-            if not isinstance(ticker_regime_info, dict):
-                ticker_regime_info = {"dominant_regime": "Range + Low Vol", "probabilities": {"Range + Low Vol": 1.0}}
-            
-            stock_regime = ticker_regime_info.get("dominant_regime", "Range + Low Vol")
-            stock_regime_probs = ticker_regime_info.get("probabilities", {stock_regime: 1.0})
-            
-            # L4: Filter strategies for THIS stock's regime
-            stock_filter = apply_all_filters(
-                strategies=all_strategies,
-                user_risk_tolerance=risk_tolerance,
-                current_regime=stock_regime,
-            )
-            stock_allowed = [s if isinstance(s, str) else s.get("name") for s in stock_filter.allowed_strategies]
-            stock_removed = [s if isinstance(s, str) else s.get("name") for s in stock_filter.removed_strategies]
-            all_removed.update(stock_removed)
-            per_stock_allowed[ticker] = stock_allowed
-            
-            # L5: Bandit for THIS stock's context
-            stock_data = enriched_data.get(ticker)
-            if stock_data is not None and hasattr(stock_data, "columns"):
-                # Use GARCH if available (Predictive), else Realized
-                if "GARCH_Vol" in stock_data.columns:
-                    stock_vol = stock_data["GARCH_Vol"].iloc[-1]
-                elif "Realized_Vol" in stock_data.columns:
-                    stock_vol = stock_data["Realized_Vol"].iloc[-1]
-                else:
-                    stock_vol = 0.15
+                
+                # === STEP 3: Load strategies for this stock's regime ===
+                allowed_strategies_for_regime = REGIME_STRATEGY_COMPAT.get(dominant_regime, ["Defensive"])
+                
+                try:
+                    strategy_outputs = run_strategies_for_regime(
+                        regime=dominant_regime,
+                        stock_data_dict={ticker: df},
+                    )
+                except Exception as e:
+                    print(f"⚠️ Strategy execution failed for {ticker} (regime={dominant_regime}): {e}")
+                    strategy_outputs = []
+                
+                if not strategy_outputs:
+                    per_stock_strategies[ticker] = "Defensive"
+                    per_stock_details[ticker] = {"allowed": ["Defensive"], "scores": {}, "no_strategies": True, "regime": dominant_regime}
+                    per_stock_allowed[ticker] = ["Defensive"]
+                    continue
+                
+                # Get strategy names from outputs
+                available_strategy_names = list(set(
+                    out.strategy_name for out in strategy_outputs if out.ticker == ticker
+                ))
+                
+                if not available_strategy_names:
+                    per_stock_strategies[ticker] = "Defensive"
+                    per_stock_details[ticker] = {"allowed": ["Defensive"], "scores": {}, "no_strategies": True, "regime": dominant_regime}
+                    per_stock_allowed[ticker] = ["Defensive"]
+                    continue
+                
+                # === STEP 4: BANDIT B — Rank strategies in this GLOBAL regime ===
+                # Get ALL strategy weights for display, then pick Top 5 for Bandit C
+                regime_bandit = self.ensemble_bandits.regime_bandits
+                all_bandit_b_weights = regime_bandit.get_bandit(dominant_regime).get_all_weights(available_strategy_names)
+                top_5_strategies = regime_bandit.rank_strategies(dominant_regime, available_strategy_names)
+                
+                # === STEP 5: BANDIT C — Walk-Forward Backtest & Pick Winner ===
+                stock_bandit_mgr = self.ensemble_bandits.stock_bandits
+                
+                # Initialize ALL top 5 strategies at once so they get random unequal weights
+                # Per-stock-per-regime model: only ~10 strategies per model
+                top_5_names = [s[0] for s in top_5_strategies]
+                stock_bandit_mgr.get_bandit(ticker, dominant_regime)._ensure_strategies(top_5_names)
+                
+                # Build per-strategy timeframe map from strategy specs
+                strategy_specs = get_strategies_for_regime(dominant_regime)
+                timeframe_map = {spec.name: spec.timeframe for spec in strategy_specs}
+                
+                # Per-strategy past return using each strategy's own TIMEFRAME
+                raw_scores = []
+                for strat_name, score_b in top_5_strategies:
+                    tf = timeframe_map.get(strat_name, 30)  # fallback 30 days
                     
-                stock_momentum = stock_data["Momentum"].iloc[-1] if "Momentum" in stock_data.columns else 0.0
-                stock_dd = stock_data["Drawdown"].iloc[-1] if "Drawdown" in stock_data.columns else 0.0
+                    # Calculate risk-adjusted past return (Sharpe-like)
+                    risk_adj_return = 0.0
+                    if len(df) >= tf and "Close" in df.columns:
+                        closes = df["Close"].values[max(0, len(df) - tf):]
+                        if len(closes) > 1:
+                            daily_rets = np.diff(closes) / closes[:-1]
+                            mean_ret = np.mean(daily_rets)
+                            std_ret = np.std(daily_rets)
+                            if std_ret > 1e-6:
+                                # Annualized Sharpe-like ratio
+                                risk_adj_return = (mean_ret / std_ret) * np.sqrt(252)
+                    
+                    # Weight from Stock Bandit (θ_C) — per-stock-per-regime
+                    theta_c = stock_bandit_mgr.sample(ticker, strat_name, regime=dominant_regime)
+                    
+                    raw_scores.append({
+                        "name": strat_name,
+                        "theta_b": score_b,
+                        "theta_c": theta_c,
+                        "risk_adj_ret": float(risk_adj_return)
+                    })
+                
+                # Normalize risk-adjusted returns to [0, 1] range for fair linear combination
+                rets = [s["risk_adj_ret"] for s in raw_scores]
+                min_ret, max_ret = min(rets), max(rets)
+                range_ret = max_ret - min_ret if max_ret > min_ret else 1.0
+                
+                stock_scored = []
+                for s in raw_scores:
+                    norm_ret = (s["risk_adj_ret"] - min_ret) / range_ret
+                    
+                    # Final Score = 30% θ_B + 40% Risk-Adj Return + 30% θ_C
+                    final_score = (0.3 * s["theta_b"]) + (0.4 * norm_ret) + (0.3 * s["theta_c"])
+                    
+                    stock_scored.append((
+                        s["name"], 
+                        s["theta_b"], 
+                        s["theta_c"], 
+                        final_score, 
+                        s["risk_adj_ret"]
+                    ))
+
+                # Rank by final score
+                stock_scored.sort(key=lambda x: x[3], reverse=True)
+                
+                if stock_scored:
+                    winner_name = stock_scored[0][0]
+                    winner_final_score = stock_scored[0][3]
+                    winner_theta_c = stock_scored[0][2]
+                else:
+                    winner_name = "Defensive"
+                    winner_final_score = 0.0
+                    winner_theta_c = 0.5
+                
+                per_stock_strategies[ticker] = winner_name
+                
+                # Build strategy_scores dict for UI (using Bandit B's base scores for the list)
+                strategy_scores = {s[0]: s[1] for s in top_5_strategies}
+                
+                per_stock_details[ticker] = {
+                    "allowed": available_strategy_names,
+                    "removed": list(set(available_strategy_names) - set([s[0] for s in top_5_strategies])),
+                    "scores": strategy_scores,
+                    "stability": stability,
+                    "hmm_confidence": hmm_confidence,
+                    "regime": dominant_regime,
+                    "winner_theta_c": winner_theta_c,
+                    "all_bandit_b_weights": {k: round(v, 4) for k, v in all_bandit_b_weights.items()},
+                    "candidates": [
+                        {
+                            "Strategy": s[0],
+                            "θ_B": round(s[1], 4),
+                            "Score": round(s[3], 4),
+                            "Past_Return": round(s[4], 4),
+                            "θ_C": round(s[2], 4),
+                        }
+                        for s in stock_scored
+                    ],
+                    "stock_filter": [
+                        {"Strategy": s[0], "Final": round(s[3], 4), "θ_C": round(s[2], 4), "Past_Ret": round(s[4], 4)}
+                        for s in stock_scored
+                    ],
+                }
+                per_stock_allowed[ticker] = available_strategy_names
+            
+            # Track the most recent dominant regime (use most common across stocks)
+            if regime_outputs:
+                from collections import Counter
+                regime_counts = Counter(info["dominant_regime"] for info in regime_outputs.values())
+                dominant_regime = regime_counts.most_common(1)[0][0]
             else:
-                stock_vol, stock_momentum, stock_dd = 0.15, 0.0, 0.0
+                dominant_regime = "Sideways"
+            self.last_regime = dominant_regime
             
-            stock_context = build_context_vector(
-                regime_probs=stock_regime_probs,
-                volatility=float(stock_vol) if hasattr(stock_vol, 'item') else stock_vol,
-                momentum=float(stock_momentum) if hasattr(stock_momentum, 'item') else stock_momentum,
-                drawdown=float(stock_dd) if hasattr(stock_dd, 'item') else stock_dd,
-                risk_score=risk_score_val,
-            )
+            # Save decisions for post-trade feedback (include per-stock regimes)
+            self.last_decisions = per_stock_strategies.copy()
+            self.last_per_stock_regimes = {t: info["dominant_regime"] for t, info in regime_outputs.items()}
             
-            bandit_strategies = stock_allowed if stock_allowed else ["Defensive"]
-            _, stock_bandit_scores = self.bandit.select_strategy(
-                context=stock_context,
-                allowed_strategies=bandit_strategies
-            )
+            # Persist bandit state after every run
+            self.ensemble_bandits.save_all()
             
-            # L6: Ranking for THIS stock
-            stock_decision = select_best_strategy(
-                allowed_strategies=stock_allowed,
-                bandit_scores=stock_bandit_scores,
-                expected_returns={s["name"]: 0.10 for s in all_strategies if s.get("name") in stock_allowed},
-            )
+            # Aggregate: most common strategy for display
+            if per_stock_strategies:
+                from collections import Counter
+                strategy_counts = Counter(per_stock_strategies.values())
+                selected_strategy = strategy_counts.most_common(1)[0][0]
+            else:
+                selected_strategy = "Defensive"
             
-            per_stock_strategies[ticker] = stock_decision.selected_strategy
+            # Aggregate for UI
+            bandit_scores = {}
+            for details in per_stock_details.values():
+                bandit_scores.update(details.get("scores", {}))
             
-            # Capture details for UI
-            per_stock_details[ticker] = {
-                "allowed": stock_allowed,
-                "removed": stock_removed,
-                "scores": stock_bandit_scores,
-            }
+            allowed_strategies = list(set().union(*[set(v) for v in per_stock_allowed.values()])) if per_stock_allowed else ["Defensive"]
+            removed_strategies = list(all_removed)
             
-            # Save context for next update
-            self.last_contexts[ticker] = stock_context
-            
-        # Save decisions for next update
-        self.last_decisions = per_stock_strategies.copy()
-        
-        # Aggregate: most common strategy for display (fallback)
-        if per_stock_strategies:
-            from collections import Counter
-            strategy_counts = Counter(per_stock_strategies.values())
-            selected_strategy = strategy_counts.most_common(1)[0][0]
-        else:
-            selected_strategy = "Defensive"
-        
-        # Keep bandit_scores as aggregate for UI (use last stock's scores for simplicity)
-        bandit_scores = stock_bandit_scores if 'stock_bandit_scores' in dir() else {}
-        
-        # Aggregate allowed/removed for UI
-        allowed_strategies = list(set().union(*per_stock_allowed.values())) if per_stock_allowed else ["Defensive"]
-        removed_strategies = list(all_removed)
-        
-        # Create a summary decision object
-        # Create a summary decision object (for normal path)
-        strategy_decision = select_best_strategy(
-            allowed_strategies=allowed_strategies,
-            bandit_scores=bandit_scores,
-            expected_returns={s["name"]: 0.10 for s in all_strategies if s.get("name") in allowed_strategies},
-        )
+            # Create summary decision (for legacy compatibility)
+            top_score = bandit_scores.get(selected_strategy, 0.5)
+            strategy_decision = type('StrategyDecision', (), {
+                'selected_strategy': selected_strategy,
+                'scores': bandit_scores,
+                'bandit_score': top_score,
+                'selection_reason': f'3-Factor Ensemble: {selected_strategy} (score: {top_score:.3f})',
+                'expected_return': top_score * 0.1,
+                'alternatives': [k for k in bandit_scores.keys() if k != selected_strategy][:3],
+                'rationale': '3-Factor Ensemble (θ_B + HMM + Stability)'
+            })()
         
         # === 7. POSITION SIZING ===
         vol_series = pd.Series({
@@ -311,10 +419,35 @@ class StrategyEngine:
         })
         forecast_vol = vol_series # Simplification
         
+        # Stability Scores for Sizing
+        stability_series = pd.Series({
+            t: info.get("stability_score", 1.0) 
+            for t, info in regime_outputs.items()
+        })
+        
+        # Inject Volatility Scalar into regime_outputs for UI
+        target_vol_val = 0.15
+        for t, vol in forecast_vol.items():
+            if t in regime_outputs:
+                # Avoid division by zero
+                safe_vol = max(vol, 0.01)
+                scalar = target_vol_val / safe_vol
+                regime_outputs[t]["volatility_scalar"] = scalar
+                regime_outputs[t]["forecast_vol"] = vol
+        
+        # Prepare weights for sizing
+        # IMPORTANT: Zero out weights for stocks in "Defensive" mode to ensure liquidation.
+        sizing_weights = user_weights.copy()
+        for ticker, strategy in per_stock_strategies.items():
+            if "Defensive" in strategy or "Cash" in strategy:
+                if ticker in sizing_weights.index:
+                    sizing_weights[ticker] = 0.0
+
         position_sizes = compute_position_sizes(
-            user_weights=user_weights,
+            user_weights=sizing_weights,
             forecast_vol=forecast_vol,
             total_capital=self.portfolio_state.cash,
+            stability_scores=stability_series,
             target_vol=0.15,
             max_vol=risk_limits["max_volatility"],
             max_dd=risk_limits["max_drawdown"],
@@ -355,7 +488,7 @@ class StrategyEngine:
         # === 9. EXECUTION SCHEDULER ===
         switch_decision = self.switch_manager.evaluate_switch(
             new_strategy=selected_strategy,
-            new_probability=strategy_decision.bandit_score,
+            new_probability=getattr(strategy_decision, 'bandit_score', bandit_scores.get(selected_strategy, 0.5)),
             current_date=current_date_str,
         )
         if switch_decision.should_switch:
@@ -496,41 +629,76 @@ class StrategyEngine:
 
     def _update_bandit(self, enriched_data: Dict[str, pd.DataFrame]):
         """
-        Update bandit posteriors based on realized rewards from the previous cycle.
-        Reward = Risk-Adj Return (Sharpe) if position was held, else 0 (or penalty).
+        POST-MARKET: Update all 3 bandits with differentiated rewards.
+        
+        Architecture:
+        - Bandit A (Global Trust): Global update (aggregated from all stocks)
+        - Bandit B (Global Ranking): Global update (aggregated from all stocks)
+        - Bandit C (Stock Preference): Per-Stock update
+        
+        Flow:
+            1. Decay ALL bandits (A, B) — ONCE per cycle
+            2. For each stock:
+               a. Compute reward
+               b. Update Global Bandit A (trust in its regime)
+               c. Update Global Bandit B (strategy in its regime)
+               d. Update Local Bandit C (strategy per stock)
+            3. Save all
         """
+        update_count = 0
+        per_stock_regimes = getattr(self, 'last_per_stock_regimes', {})
+        is_ambiguous = False
+        
+        # ===== STEP 1: Decay EVERYONE ONCE =====
+        # Decays all global params
+        self.ensemble_bandits.decay_all_bandits()
+        print(f"  ⏳ Decayed all bandits (Global A & B)")
+        
+        # ===== STEP 2: Update per-stock =====
         for ticker, strategy in self.last_decisions.items():
-            if ticker not in enriched_data: continue
+            if ticker not in enriched_data:
+                continue
             
             df = enriched_data[ticker]
-            if df.empty or "Returns" not in df.columns: continue
+            if df.empty:
+                continue
             
-            # 1. Did we participate? (Check T-1 holdings)
-            # self.portfolio_state has holdings from START of this run (end of prev cycle)
+            # Use this stock's regime (fallback to global)
+            regime = per_stock_regimes.get(ticker, self.last_regime or "Sideways")
+            
             qty = self.portfolio_state.positions.get(ticker, 0)
             
-            # 2. Calculate Strategy Return
-            # If Qty > 0, we captured the market return (simplified)
-            # If Qty == 0, we got 0 return (Cash)
-            mkt_return = df["Returns"].iloc[-1]
-            mkt_vol = df["Realized_Vol"].iloc[-1] if "Realized_Vol" in df.columns else 0.15
-            mkt_dd = df["Max_Drawdown"].iloc[-1] if "Max_Drawdown" in df.columns else 0.0
-            
-            if abs(qty) > 0:
-                strategy_return = mkt_return
+            if "Returns" in df.columns:
+                daily_return = df["Returns"].iloc[-1] if abs(qty) > 0 else 0.0
+            elif "Return_1D" in df.columns:
+                daily_return = df["Return_1D"].iloc[-1] if abs(qty) > 0 else 0.0
             else:
-                strategy_return = 0.0
+                daily_return = 0.0
             
-            # 3. Compute Bandit Reward
-            reward = self.bandit.compute_reward(
-                returns=strategy_return,
-                volatility=mkt_vol,
-                drawdown=mkt_dd
+            if "Realized_Vol" in df.columns:
+                vol_60d = df["Realized_Vol"].iloc[-1]
+            else:
+                vol_60d = 0.15
+            
+            # Using actual raw return for new feedback setup
+            rewards = {"A": daily_return, "B": daily_return, "C": daily_return}
+            
+            # Update arms for THIS ticker
+            # Note: persistence.update_arm handles the global/local routing
+            self.ensemble_bandits.update_arm(
+                ticker=ticker,
+                regime=regime,
+                strategy_name=strategy,
+                rewards=rewards,
             )
+            update_count += 1
             
-            # 4. Update
-            context = self.last_contexts.get(ticker)
-            self.bandit.update(strategy, reward, context)
+        print(f"  🧠 Learning complete: {update_count} per-stock feedback updates aggregated")
+        
+        # ===== STEP 3: Save =====
+        if update_count > 0:
+            self.ensemble_bandits.save_all()
+            print(f"🧠 Learning complete: {update_count} per-stock updates")
 
     def _compute_avg_drawdown(self, enriched_data: dict) -> float:
         dds = []
@@ -541,7 +709,7 @@ class StrategyEngine:
 
     def get_performance(self): return self.monitor.compute_metrics()
     def get_decision_history(self, n: int = 10): return self.monitor.get_recent_decisions(n)
-    def get_bandit_stats(self): return self.bandit.get_stats()
+    def get_bandit_stats(self): return self.ensemble_bandits.get_stats()
 
 
 def run_engine(

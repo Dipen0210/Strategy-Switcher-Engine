@@ -14,3 +14,8 @@ env/
 build/
 dist/
 *.egg-info/
+.vscode/
+.agent/
+.claude/
+.gemini/
+.cursor/    

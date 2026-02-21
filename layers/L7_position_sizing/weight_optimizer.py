@@ -57,14 +57,15 @@ def mean_variance_optimize(mu, cov_matrix, risk_level="medium"):
 def volatility_adjusted_sizing(
     raw_weights: pd.Series,
     forecast_vol: pd.Series,
+    stability_scores: pd.Series = None,
     target_vol: float = 0.15,
-    max_position: float = 1.0,  # Changed from 0.25 to 1.0 to respect user weights
+    max_position: float = 1.0,
     min_position: float = 0.01,
 ) -> pd.Series:
     """
-    Adjust position sizes based on volatility.
+    Adjust position sizes based on volatility and regime stability.
     
-    Formula: Adjusted Weight = Raw Weight × (Target Vol / Forecast Vol)
+    Formula: Adjusted Weight = Raw Weight × (Target Vol / Forecast Vol) × Stability Score
     """
     if raw_weights.empty:
         return raw_weights
@@ -77,8 +78,16 @@ def volatility_adjusted_sizing(
     vol = forecast_vol.reindex(common_idx).fillna(target_vol)
     vol = vol.replace(0, target_vol)
     
+    # 1. Volatility Scalar
     vol_adjustment = target_vol / vol
     adjusted = raw * vol_adjustment
+    
+    # 2. Stability Scalar (Regime Confusion Penalty)
+    if stability_scores is not None and not stability_scores.empty:
+        # Align indices
+        stab = stability_scores.reindex(common_idx).fillna(1.0) # Default to 1.0 (Stable) if missing
+        adjusted = adjusted * stab
+    
     adjusted = adjusted.clip(upper=max_position)
     
     total = adjusted.sum()
@@ -99,6 +108,7 @@ def compute_position_sizes(
     user_weights: pd.Series,
     forecast_vol: pd.Series,
     total_capital: float,
+    stability_scores: pd.Series = None,
     target_vol: float = 0.15,
     max_vol: float = 0.25,
     max_dd: float = 0.20,
@@ -110,6 +120,7 @@ def compute_position_sizes(
     adjusted = volatility_adjusted_sizing(
         raw_weights=user_weights,
         forecast_vol=forecast_vol,
+        stability_scores=stability_scores,
         target_vol=target_vol,
     )
     

@@ -2,11 +2,9 @@
 """
 Strategy Engine — Streamlit Dashboard
 
-10-Layer automated strategy switching system with:
-- HMM regime detection
-- Contextual bandit learning
-- Risk-constrained strategy selection
-- Volatility-based position sizing
+Hierarchical Bandit Architecture:
+  Bandit A (regime trust) → Bandit B (strategy ranking) → Bandit C (stock filter)
+  HMM detects regimes. Bandits learn from P&L feedback.
 """
 
 from datetime import datetime, timedelta, date
@@ -36,19 +34,19 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------
-# Auto-Reset Logs on Page Refresh (New Session)
+# Session State Initialization
 # ---------------------------------------------------------
 if "session_initialized" not in st.session_state:
-    # This block runs only once when the user opens/refreshes the page
-    clear_cycle_log()
-    clear_transaction_log()
-    clear_signal_log()
     st.session_state.session_initialized = True
-    # Initial clear feedback (optional, logging to console)
-    print("Logs cleared for new session.")
+    # Auto-clear trading logs on fresh session (browser refresh / new session)
+    # Bandit models are PRESERVED — only in-memory logs are cleared
+    clear_signal_log()
+    clear_transaction_log()
+    clear_cycle_log()
+
 
 st.title("🎯 Strategy Engine")
-st.caption("Automated strategy switching with HMM regime detection")
+st.caption("Hierarchical bandit system with HMM regime detection")
 
 # Fixed stock universe
 AVAILABLE_STOCKS = {
@@ -70,7 +68,7 @@ selected_tickers = st.sidebar.multiselect(
     options=list(AVAILABLE_STOCKS.keys()),
     default=[],
     format_func=lambda x: f"{x} - {AVAILABLE_STOCKS[x]}",
-    key="stock_selector",  # Explicit key for reset
+    key="stock_selector",
 )
 
 if not selected_tickers:
@@ -121,7 +119,6 @@ st.sidebar.caption(
 )
 
 # Unified data fetch: 60 days covers all strategy requirements
-# Momentum: 60, Mean Reversion: 30, Breakout: 20, Defensive: 60
 DATA_LOOKBACK_DAYS = 60
 
 # Session state
@@ -134,23 +131,20 @@ if "run_requested" not in st.session_state:
 if "rebalance_requested" not in st.session_state:
     st.session_state.rebalance_requested = False
 if "current_as_of_date" not in st.session_state:
-    st.session_state.current_as_of_date = None  # Will be set on first Run
+    st.session_state.current_as_of_date = None
 if "strategy_engine" not in st.session_state:
-    st.session_state.strategy_engine = None  # Persists PortfolioState across cycles
+    st.session_state.strategy_engine = None
 
 # --- Sidebar Action Buttons ---
 st.sidebar.divider()
-# Determine button label based on state
 is_first_run = st.session_state.current_as_of_date is None
 button_label = "🚀 Run Strategy" if is_first_run else "🔄 Rebalance (Next Cycle)"
 button_type = "primary" if is_first_run else "secondary"
 
-if st.sidebar.button(button_label, use_container_width=True, type=button_type):
-    # 0. Validate Allocation (Must be 100%)
-    # Read from the authoritative user_weights dict
+if st.sidebar.button(button_label, width="stretch", type=button_type):
+    # Validate Allocation (Must be 100%)
     if "user_weights" in st.session_state and st.session_state.user_weights:
         current_total = sum(st.session_state.user_weights.values())
-        
         if abs(current_total - 100.0) > 0.1:
             st.sidebar.error(f"⚠️ Total Allocation is {current_total:.1f}%!")
             st.sidebar.error("Must be 100%. Please check 'Allocation' tab.")
@@ -159,21 +153,16 @@ if st.sidebar.button(button_label, use_container_width=True, type=button_type):
     today = date.today()
     
     if st.session_state.current_as_of_date is None:
-        # FIRST RUN: Use selected "As of Date" (Execution Date)
-        # Fix: Start on the actual trading day (e.g., Monday 12th), not the data day (Friday 9th)
         st.session_state.current_as_of_date = execution_date
         st.session_state.run_requested = True
     else:
-        # REBALANCE: Advance date
         freq_days = {"Daily": 1, "Weekly": 7, "Monthly": 30}
         days_to_add = freq_days.get(rebalance_freq, 7)
         new_date = st.session_state.current_as_of_date + timedelta(days=days_to_add)
         
-        # Skip non-business days
         while not is_us_business_day(new_date):
             new_date += timedelta(days=1)
             
-        # Stop if future date
         if new_date.date() > today:
             st.sidebar.error(f"⚠️ Cannot advance to {new_date.strftime('%Y-%m-%d')} - no market data for future dates!")
             st.stop()
@@ -193,22 +182,20 @@ if st.session_state.current_as_of_date is not None:
     st.sidebar.caption(f"⏭️ Next rebalance: {next_date.strftime('%Y-%m-%d')}")
 
 # ---------------------------------------------------------
-# Main Screen — Tabbed Interface
+# Main Screen — 7 Tabs
 # ---------------------------------------------------------
-tab_allocation, tab_strategy, tab_regime, tab_positions, tab_signals, tab_execution, tab_portfolio, tab_performance, tab_history = st.tabs([
+tab_allocation, tab_regime, tab_bandits, tab_strategy, tab_sizing, tab_execution, tab_history = st.tabs([
     "📊 Allocation",
-    "🎯 Strategy", 
     "🌊 Regime",
+    "🧠 Bandits",
+    "🎯 Strategy",
     "💰 Sizing",
-    "📡 Signals",
     "⚡ Execution",
-    "📋 Portfolio",
-    "📈 Performance",
-    "📜 History"
+    "📜 History",
 ])
 
 # ---------------------------------------------------------
-# Tab 1: Asset Allocation (moved from sidebar)
+# Tab 1: Asset Allocation
 # ---------------------------------------------------------
 with tab_allocation:
     st.header("Asset Allocation")
@@ -216,16 +203,11 @@ with tab_allocation:
     
     st.divider()
     
-    # Create columns for sliders
     cols = st.columns(min(len(tickers), 3))
     
-    # =======================================================
-    # WEIGHT STORAGE: Use a dedicated session state dict
-    # =======================================================
     if "user_weights" not in st.session_state:
         st.session_state.user_weights = {}
     
-    # Initialize defaults for any new tickers
     default_per_stock = 100.0 / len(tickers) if tickers else 0.0
     for ticker in tickers:
         if ticker not in st.session_state.user_weights:
@@ -237,13 +219,11 @@ with tab_allocation:
     for old_ticker in stored_tickers - current_tickers:
         del st.session_state.user_weights[old_ticker]
     
-    # Callback function for slider changes
     def update_weight(ticker):
         key = f"slider_{ticker}"
         if key in st.session_state:
             st.session_state.user_weights[ticker] = st.session_state[key]
     
-    # Render sliders with callbacks
     for i, ticker in enumerate(tickers):
         col_idx = i % 3
         with cols[col_idx]:
@@ -259,13 +239,11 @@ with tab_allocation:
                 help="Target allocation %"
             )
     
-    # Read weights from the authoritative source
     weights = st.session_state.user_weights.copy()
     total_allocated = sum(weights.values())
     
     st.divider()
     
-    # Allocation summary with pie chart
     col1, col2 = st.columns([1, 2])
     
     with col1:
@@ -278,7 +256,6 @@ with tab_allocation:
                 if st.button("⚖️ Auto-Normalize to 100%"):
                     factor = 100.0 / total
                     for t in tickers:
-                        # Update session state for next rerun
                         key = f"weight_v2_{t}"
                         if key in st.session_state:
                             st.session_state[key] = st.session_state[key] * factor
@@ -306,7 +283,7 @@ with tab_allocation:
                 color_discrete_sequence=px.colors.qualitative.Set2
             )
             fig.update_layout(height=350)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
     
     st.divider()
     
@@ -316,14 +293,10 @@ with tab_allocation:
         st.session_state.run_requested = False
         st.session_state.rebalance_requested = False
         
-        # Use the tracked date (advances on rebalance)
         run_date = st.session_state.current_as_of_date
-        
-        # Display which date we're running on
         st.info(f"📅 Running for date: **{run_date.strftime('%Y-%m-%d')}**")
         
         with st.spinner("Loading market data..."):
-            # Use run_date for data end point
             end_date = run_date.strftime("%Y-%m-%d")
             start_date = (run_date - timedelta(days=DATA_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
             
@@ -345,19 +318,13 @@ with tab_allocation:
             action = "Rebalancing" if is_rebalance else "Running Strategy Engine"
             with st.spinner(f"{action}..."):
                 try:
-                    # RE-FETCH weights from session state to ensure fresh inputs
-                    # NOW READING STRICTLY FROM THE 'user_weights' DICT
                     current_weights = []
-                    
-                    # Ensure we iterate in the same order as 'tickers' passed to create_policy
                     for t in tickers:
-                        # Default to 0 if not found (should be caught by 100% check earlier)
                         w = st.session_state.user_weights.get(t, 0.0)
                         current_weights.append(w / 100.0)
                     
                     weight_list = current_weights
                     
-                    # Create policy
                     policy = create_policy(
                         tickers=tickers,
                         weights=weight_list,
@@ -366,20 +333,12 @@ with tab_allocation:
                         rebalance_frequency=rebalance_freq,
                     )
                     
-                    # On RUN: Create new engine (fresh start)
-                    # On REBALANCE: Reuse existing engine (preserves PortfolioState for P/L)
                     if not is_rebalance or st.session_state.strategy_engine is None:
-                        # Create fresh engine on Run button
                         st.session_state.strategy_engine = StrategyEngine(policy)
                     else:
-                        # Rebalance: update policy but keep existing PortfolioState
                         engine = st.session_state.strategy_engine
                         engine.policy = policy
                     
-                    # Run the engine
-                    # Pipeline calculates execution as T+1 from 'current_date'.
-                    # User picked 'run_date' as the EXECUTION date.
-                    # So we pass T-1 to the pipeline.
                     pipeline_input_date = previous_trading_day(run_date)
                     
                     result = st.session_state.strategy_engine.run(
@@ -396,113 +355,286 @@ with tab_allocation:
         else:
             st.error("No data loaded. Please check tickers.")
     
-    # Show hint if no result
     if st.session_state.result is None:
         st.info("👈 Click 'Run Strategy' or 'Rebalance' in the sidebar to execute")
 
 # ---------------------------------------------------------
-# Tab 2: Strategy Selection
-# ---------------------------------------------------------
-with tab_strategy:
-    st.header("Strategy Selection")
-    
-    result = st.session_state.result
-    
-    if result:
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric(
-                "Selected Strategy",
-                result.selected_strategy,
-                help=getattr(result.strategy_decision, 'selection_reason', '')
-            )
-        
-        with col2:
-            exp_ret = getattr(result.strategy_decision, 'expected_return', 0.1)
-            st.metric("Expected Return", f"{exp_ret:.1%}" if isinstance(exp_ret, float) else "N/A")
-        
-        with col3:
-            st.metric("Risk Level", getattr(result.strategy_decision, 'risk_level', risk_tolerance))
-        
-        st.divider()
-        
-        st.divider()
-        st.info("ℹ️ Strategy selection, filtering, and scoring is performed independently for each stock based on its regime.")
-        
-        
-        # Per-stock strategy assignment table
-        if result.per_stock_strategies:
-            st.divider()
-            st.subheader("📊 Per-Stock Strategy Assignment")
-            
-            strategy_data = []
-            for ticker, strategy in result.per_stock_strategies.items():
-                regime_info = result.regime_output.get(ticker, {})
-                regime = regime_info.get("dominant_regime", "Unknown") if isinstance(regime_info, dict) else "Unknown"
-                
-                # Fetch details
-                details = getattr(result, "per_stock_details", {}).get(ticker, {})
-                allowed = details.get("allowed", [])
-                removed = details.get("removed", [])
-                scores = details.get("scores", {})
-                current_score = scores.get(strategy, 0.0)
-                
-                strategy_data.append({
-                    "Ticker": ticker,
-                    "Regime": regime,
-                    "Selected Strategy": f"{strategy} ({current_score:.3f})",
-                    "Allowed Strategies": ", ".join(allowed),
-                    "Filtered Out": ", ".join(removed)
-                })
-            
-            strategy_df = pd.DataFrame(strategy_data)
-            st.dataframe(strategy_df, hide_index=True, use_container_width=True)
-    else:
-        st.info("👈 Configure allocation and run the engine to see strategy selection")
-
-# ---------------------------------------------------------
-# Tab 3: Regime Detection
+# Tab 2: Regime Detection
 # ---------------------------------------------------------
 with tab_regime:
-    st.header("Regime Detection")
+    st.header("🌊 Regime Detection")
+    st.caption("HMM runs on each stock's data → Bandit A blends with global trust weights → per-stock regime")
     
     result = st.session_state.result
     
-    if result:
-        st.subheader(f"🎯 Dominant Regime: {result.dominant_regime}")
+    if result and result.regime_output:
+        regime_colors = {
+            "Bull-Quiet": "🟢", "Bull-Volatile": "🟡",
+            "Sideways": "🔵", "Crisis": "🔴"
+        }
+        color_map = {
+            "Bull-Quiet": "#22c55e", "Bull-Volatile": "#eab308",
+            "Sideways": "#3b82f6", "Crisis": "#ef4444"
+        }
         
-        if result.regime_output:
-            for ticker, regime_info in result.regime_output.items():
-                with st.expander(f"📈 {ticker} - {AVAILABLE_STOCKS.get(ticker, ticker)}", expanded=True):
-                    probs = regime_info.get("probabilities", {})
+        # Summary: count how many stocks in each regime
+        regime_counts = {}
+        for ticker, info in result.regime_output.items():
+            r = info.get("dominant_regime", "Unknown")
+            regime_counts[r] = regime_counts.get(r, 0) + 1
+        
+        summary_cols = st.columns(len(regime_counts))
+        for i, (regime, count) in enumerate(regime_counts.items()):
+            summary_cols[i].metric(
+                f"{regime_colors.get(regime, '⚪')} {regime}",
+                f"{count} stock{'s' if count > 1 else ''}"
+            )
+        
+        st.divider()
+        
+        # Per-stock regime details
+        for ticker, regime_info in result.regime_output.items():
+            dominant = regime_info.get("dominant_regime", "Unknown")
+            hmm_conf = regime_info.get("hmm_confidence", 0.0)
+            stability = regime_info.get("stability_score", 0.0)
+            is_ambiguous = regime_info.get("is_ambiguous", False)
+            transition = regime_info.get("transition_flag", False)
+            probs = regime_info.get("probabilities", {})
+            
+            icon = regime_colors.get(dominant, "⚪")
+            status = "⚠️ Ambiguous" if is_ambiguous else ("🔄 Transition" if transition else "✅ Stable")
+            
+            with st.expander(f"{icon} **{ticker}** — {dominant}  |  Conf: {hmm_conf:.1%}  |  {status}", expanded=False):
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Regime", f"{icon} {dominant}")
+                c2.metric("HMM Confidence", f"{hmm_conf:.1%}")
+                c3.metric("Stability", f"{stability:.2f}")
+                c4.metric("Status", status)
+                
+                if is_ambiguous:
+                    st.warning("⚠️ Confidence < 0.55 — ambiguous regime, defensive bias applied.")
+                
+                if probs:
+                    prob_df = pd.DataFrame({
+                        "Regime": list(probs.keys()),
+                        "Probability": list(probs.values())
+                    }).sort_values("Probability", ascending=True)
                     
-                    if probs:
-                        prob_df = pd.DataFrame({
-                            "Regime": list(probs.keys()),
-                            "Probability": list(probs.values())
-                        })
-                        
-                        fig = px.bar(
-                            prob_df,
-                            x="Regime",
-                            y="Probability",
-                            color="Probability",
-                            color_continuous_scale="RdYlGn",
-                            title=f"{ticker} Regime Probabilities"
-                        )
-                        fig.update_layout(showlegend=False, height=300)
-                        st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No regime data available")
+                    fig = px.bar(
+                        prob_df, y="Regime", x="Probability",
+                        orientation="h",
+                        text=prob_df["Probability"].apply(lambda x: f"{x:.1%}"),
+                        color="Regime",
+                        color_discrete_map=color_map,
+                    )
+                    fig.update_layout(
+                        height=200, showlegend=False,
+                        xaxis_title="Blended Probability (HMM + Global Trust)",
+                        xaxis=dict(tickformat=".0%", range=[0, 1]),
+                        margin=dict(l=0, r=0, t=0, b=0),
+                    )
+                    fig.update_traces(textposition="outside")
+                    st.plotly_chart(fig, use_container_width=True, key=f"regime_chart_{ticker}")
     else:
         st.info("👈 Run the strategy engine to see regime detection results")
 
 # ---------------------------------------------------------
-# Tab 4: Position Sizing
+# Tab 3: Bandits (Hierarchical 3-Level)
 # ---------------------------------------------------------
-with tab_positions:
-    st.header("Position Sizing")
+# Tab 3: Bandits (Hierarchical 3-Level)
+# ---------------------------------------------------------
+with tab_bandits:
+    st.header("🧠 Hierarchical Bandit System")
+    st.caption("Three bandits learn at different speeds from P&L feedback")
+    
+    engine = st.session_state.get("strategy_engine")
+    result = st.session_state.result
+    
+    # helper to get available tickers
+    available_tickers = []
+    if result and result.per_stock_strategies:
+        available_tickers = sorted(list(result.per_stock_strategies.keys()))
+    elif engine and engine.ensemble_bandits.stock_bandits:
+        available_tickers = sorted(list(engine.ensemble_bandits.stock_bandits.bandits.keys()))
+        
+    selected_ticker = st.selectbox(
+        "Select Stock to Inspect:", 
+        available_tickers if available_tickers else ["No Data"],
+        index=0 if available_tickers else 0
+    )
+    
+    # Context: What is this stock doing?
+    current_regime = "Sideways"
+    confidence = 0.0
+    stability = 0.0
+    
+    if result and result.regime_output and selected_ticker in result.regime_output:
+        info = result.regime_output[selected_ticker]
+        current_regime = info["dominant_regime"]
+        confidence = info.get("hmm_confidence", 0.0)
+        stability = info.get("stability_score", 0.0)
+        
+    st.info(f"📊 **Context for {selected_ticker}**: Regime = **{current_regime}** (Conf: {confidence:.1%}, Stability: {stability:.2f})")
+    
+    st.divider()
+
+    candidates = []
+    all_b_weights = {}
+    if result and result.per_stock_details and selected_ticker in result.per_stock_details:
+        candidates = result.per_stock_details[selected_ticker].get("candidates", [])
+        all_b_weights = result.per_stock_details[selected_ticker].get("all_bandit_b_weights", {})
+
+    # ---- BANDIT B: ALL Strategy Weights in Regime ----
+    st.subheader(f"🅱️ Bandit B (Strategy Weights) for {current_regime}")
+    st.caption(f"All strategies in the {current_regime} regime with their learned RL weights (sum = 100%). Top 5 are sent to Bandit C.")
+    
+    if all_b_weights:
+        df_b = pd.DataFrame([
+            {"Strategy": name, "Weight (θ_B)": weight}
+            for name, weight in all_b_weights.items()
+        ])
+        df_b = df_b.sort_values("Weight (θ_B)", ascending=False).reset_index(drop=True)
+        
+        col_b1, col_b2 = st.columns([2, 1])
+        with col_b1:
+            fig = px.bar(
+                df_b, x="Strategy", y="Weight (θ_B)",
+                text=df_b["Weight (θ_B)"].apply(lambda x: f"{x:.4f}"), 
+                color="Weight (θ_B)",
+                color_continuous_scale="Viridis"
+            )
+            fig.update_layout(height=350, showlegend=False, margin=dict(l=0, r=0, t=30, b=0))
+            fig.update_traces(textposition="outside")
+            st.plotly_chart(fig, use_container_width=True, key=f"bandit_b_chart_{selected_ticker}")
+        with col_b2:
+            display_b = df_b.copy()
+            display_b["Weight (θ_B)"] = display_b["Weight (θ_B)"].apply(lambda x: f"{x:.4f}")
+            st.dataframe(display_b, hide_index=True, use_container_width=True)
+            st.caption(f"Total: {sum(all_b_weights.values()):.4f}")
+    else:
+        st.info("No Strategy Bandit data found. Run the engine.")
+    
+    st.divider()
+    
+    # ---- BANDIT C: Top 5 from B → Historical Evaluation ----
+    st.subheader(f"©️ Bandit C (Stock Preference & Final Eval) for {selected_ticker}")
+    st.caption(f"Top 5 strategies from Bandit B with ε-greedy. Final Score = 30% θ_B + 40% Norm Risk-Adj Ret + 30% θ_C.")
+    
+    if candidates:
+        df_c = pd.DataFrame(candidates)[["Strategy", "θ_B", "Past_Return", "θ_C", "Score"]]
+        df_c = df_c.rename(columns={
+            "θ_B": "Bandit B Weight (θ_B)",
+            "Past_Return": "Risk-Adj Return (Sharpe)",
+            "θ_C": "Stock Preference (θ_C)",
+            "Score": "Final Score (Linear Combo)"
+        })
+        # Sort by Final Score (highest to lowest)
+        df_c = df_c.sort_values("Final Score (Linear Combo)", ascending=False).reset_index(drop=True)
+        st.dataframe(df_c, hide_index=True, use_container_width=True)
+    else:
+        st.info("No Stock Bandit evaluation data found. Run the engine.")
+    
+    st.divider()
+    
+    # ---- BANDIT C: Learned Weights Visualization ----
+    st.subheader(f"📊 Bandit C Learned Weights: {selected_ticker} × {current_regime}")
+    st.caption(f"All strategy weights stored in the {selected_ticker}_{current_regime.replace('-','_')} model (sum = 100%). Updated after each feedback cycle.")
+    
+    engine = st.session_state.get("strategy_engine")
+    if engine and engine.ensemble_bandits.stock_bandits:
+        sb = engine.ensemble_bandits.stock_bandits.get_bandit(selected_ticker, current_regime)
+        if sb.strategies:
+            df_weights = pd.DataFrame([
+                {"Strategy": name, "Learned Weight (θ_C)": weight}
+                for name, weight in sb.strategies.items()
+            ])
+            df_weights = df_weights.sort_values("Learned Weight (θ_C)", ascending=False).reset_index(drop=True)
+            
+            col_c1, col_c2 = st.columns([2, 1])
+            with col_c1:
+                fig = px.bar(
+                    df_weights, x="Strategy", y="Learned Weight (θ_C)",
+                    text=df_weights["Learned Weight (θ_C)"].apply(lambda x: f"{x:.4f}"),
+                    color="Learned Weight (θ_C)",
+                    color_continuous_scale="Plasma"
+                )
+                fig.update_layout(height=350, showlegend=False, margin=dict(l=0, r=0, t=30, b=0))
+                fig.update_traces(textposition="outside")
+                st.plotly_chart(fig, use_container_width=True, key=f"bandit_c_weights_{selected_ticker}_{current_regime}")
+            with col_c2:
+                display_w = df_weights.copy()
+                display_w["Learned Weight (θ_C)"] = display_w["Learned Weight (θ_C)"].apply(lambda x: f"{x:.4f}")
+                st.dataframe(display_w, hide_index=True, use_container_width=True)
+                st.caption(f"Total: {sum(sb.strategies.values()):.4f}")
+        else:
+            st.info(f"No learned weights yet for {selected_ticker} in {current_regime}. Run the engine.")
+    else:
+        st.info("Engine not loaded. Run the engine to see learned weights.")
+
+# ---------------------------------------------------------
+# Tab 4: Strategy Selection (per-stock summary)
+# ---------------------------------------------------------
+with tab_strategy:
+    st.header("🎯 Strategy Selection")
+    
+    result = st.session_state.result
+    
+    if result:
+        # Header metrics
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Primary Strategy", result.selected_strategy)
+        col2.metric("Regime", result.dominant_regime)
+        col3.metric("Execution Time", f"{result.execution_time_ms:.0f}ms")
+        
+        st.divider()
+        
+        # Per-stock strategy assignment table
+        if result.per_stock_strategies:
+            st.subheader("Per-Stock Strategy Assignment")
+            
+            strategy_data = []
+            for ticker, strategy in result.per_stock_strategies.items():
+                details = (result.per_stock_details or {}).get(ticker, {})
+                scores = details.get("scores", {})
+                current_score = scores.get(strategy, 0.0)
+                theta_c = details.get("winner_theta_c", 0.0)
+                hmm_conf = details.get("hmm_confidence", 0.0)
+                stab = details.get("stability", 0.0)
+                regime = details.get("regime", result.dominant_regime)
+                allowed = details.get("allowed", [])
+                
+                strategy_data.append({
+                    "Ticker": ticker,
+                    "Regime": regime,
+                    "Winner": strategy,
+                    "Score": f"{current_score:.3f}",
+                    "θ_C": f"{theta_c:.3f}",
+                    "HMM Conf": f"{hmm_conf:.1%}",
+                    "Stability": f"{stab:.2f}",
+                    "# Available": len(allowed),
+                })
+            
+            strategy_df = pd.DataFrame(strategy_data)
+            st.dataframe(strategy_df, hide_index=True, use_container_width=True)
+        
+        # Strategy switch decision
+        if result.switch_decision:
+            st.divider()
+            st.subheader("🔄 Strategy Switch Decision")
+            switch = result.switch_decision
+            if hasattr(switch, 'should_switch'):
+                if switch.should_switch:
+                    st.success(f"✅ Strategy switch approved: {switch.reason if hasattr(switch, 'reason') else ''}")
+                else:
+                    st.warning(f"⏸️ Strategy switch blocked: {switch.reason if hasattr(switch, 'reason') else 'Cooldown/threshold'}")
+    else:
+        st.info("👈 Run the engine to see strategy selection")
+
+# ---------------------------------------------------------
+# Tab 5: Position Sizing
+# ---------------------------------------------------------
+with tab_sizing:
+    st.header("💰 Position Sizing")
     
     result = st.session_state.result
     
@@ -510,11 +642,7 @@ with tab_positions:
         if result.position_sizes is not None and not result.position_sizes.empty:
             pos_df = result.position_sizes.copy()
             
-            # Format display
-            # Format display
             display_df = pos_df.copy()
-            
-            # Explicit rename for user clarity
             rename_map = {
                 "User_Weight": "Your Input",
                 "Adjusted_Weight": "Volatility Sized",
@@ -522,7 +650,6 @@ with tab_positions:
             }
             display_df = display_df.rename(columns=rename_map)
             
-            # Format percentages and currency
             for col in ["Your Input", "Volatility Sized"]:
                 if col in display_df.columns:
                     display_df[col] = display_df[col].apply(lambda x: f"{x:.1%}")
@@ -534,9 +661,7 @@ with tab_positions:
             st.divider()
             st.subheader("⚖️ Sizing Impact: Input vs. Risk-Adjusted")
             
-            # Comparison Chart
             if "Ticker" in pos_df.columns:
-                # Melt for grouped bar chart
                 chart_data = pos_df.melt(
                     id_vars=["Ticker"], 
                     value_vars=["User_Weight", "Adjusted_Weight"],
@@ -550,9 +675,7 @@ with tab_positions:
                 
                 fig = px.bar(
                     chart_data,
-                    x="Ticker",
-                    y="Weight",
-                    color="Type",
+                    x="Ticker", y="Weight", color="Type",
                     barmode="group",
                     title="Comparison: User Intent vs. Risk Sizing",
                     text_auto=".1%",
@@ -562,21 +685,21 @@ with tab_positions:
         else:
             st.info("No position sizing data available")
     else:
-        st.info("👈 Run the strategy engine to see position sizing results")
+        st.info("👈 Run the engine to see position sizing")
 
 # ---------------------------------------------------------
-# Tab 5: Trade Signals (Layer 8)
+# Tab 6: Execution (Signals + Trade Execution)
 # ---------------------------------------------------------
-with tab_signals:
-    st.header("📡 Trade Signals")
+with tab_execution:
+    st.header("⚡ Execution")
     
     result = st.session_state.result
     
     if result:
+        # --- Signals Section ---
         if result.signals_df is not None and not result.signals_df.empty:
-            st.subheader("Generated Signals")
+            st.subheader("📡 Trade Signals")
             
-            # Color-code signals
             def signal_color(signal):
                 colors = {
                     "BUY": "🟢", "SELL": "🔴", "REBALANCE": "🔵",
@@ -588,56 +711,35 @@ with tab_signals:
             if "Signal" in signals_display.columns:
                 signals_display["Action"] = signals_display["Signal"].apply(signal_color) + " " + signals_display["Signal"].astype(str)
             
-            st.dataframe(signals_display, hide_index=True, use_container_width=True)
-            
-            # Signal summary
+            # Signal summary metrics
             if "Signal" in result.signals_df.columns:
                 signal_counts = result.signals_df["Signal"].value_counts().to_dict()
                 cols = st.columns(len(signal_counts))
                 for i, (signal, count) in enumerate(signal_counts.items()):
                     cols[i].metric(signal, count)
+            
+            st.dataframe(signals_display, hide_index=True, use_container_width=True)
         else:
             st.info("No trade signals generated (portfolio unchanged)")
         
-        # Strategy switch decision
-        if result.switch_decision:
-            st.divider()
-            st.subheader("🔄 Strategy Switch Decision")
-            switch = result.switch_decision
-            if hasattr(switch, 'should_switch'):
-                if switch.should_switch:
-                    st.success(f"✅ Strategy switch approved: {switch.reason if hasattr(switch, 'reason') else ''}")
-                else:
-                    st.warning(f"⏸️ Strategy switch blocked: {switch.reason if hasattr(switch, 'reason') else 'Cooldown/threshold'}")
-    else:
-        st.info("👈 Run the strategy engine to see trade signals")
-
-# ---------------------------------------------------------
-# Tab 6: Execution (Layer 9-10)
-# ---------------------------------------------------------
-with tab_execution:
-    st.header("⚡ Trade Execution")
-    
-    result = st.session_state.result
-    
-    if result:
+        st.divider()
+        
+        # --- Execution Report ---
         if result.execution_report:
+            st.subheader("📋 Execution Report")
             report = result.execution_report
             
             if "error" in report:
                 st.error(f"Execution Error: {report['error']}")
             else:
-                # Execution metrics
                 col1, col2, col3, col4 = st.columns(4)
                 col1.metric("Orders Executed", report.get("orders_executed", 0))
                 col2.metric("Total Volume", f"${report.get('total_volume', 0):,.2f}")
                 col3.metric("Fees Paid", f"${report.get('fees_paid', 0):,.2f}")
                 col4.metric("Cash After", f"${report.get('cash_after', 0):,.2f}")
                 
-                # Order details
                 orders = report.get("orders")
                 if orders is not None:
-                    # Handle both DataFrame and list
                     if hasattr(orders, 'empty'):
                         has_orders = not orders.empty
                         orders_df = orders
@@ -646,216 +748,120 @@ with tab_execution:
                         orders_df = pd.DataFrame(orders) if orders else pd.DataFrame()
                     
                     if has_orders:
-                        st.divider()
-                        st.subheader("Order Details")
                         st.dataframe(orders_df, hide_index=True, use_container_width=True)
         else:
             st.info("No execution report available")
     else:
-        st.info("👈 Run the strategy engine to see execution details")
+        st.info("👈 Run the engine to see execution details")
 
 # ---------------------------------------------------------
-# Tab 7: Portfolio State (Layer 11)
-# ---------------------------------------------------------
-with tab_portfolio:
-    st.header("📋 Portfolio State")
-    
-    result = st.session_state.result
-    
-    if result:
-        if result.portfolio_state:
-            state = result.portfolio_state
-            
-            # Portfolio overview
-            col1, col2, col3 = st.columns(3)
-            col1.metric("💵 Cash", f"${state.get('cash', 0):,.2f}")
-            col2.metric("📈 Realized P&L", f"${state.get('realized_pnl', 0):,.2f}")
-            col3.metric("📊 # Trades", state.get("num_trades", 0))
-            
-            # Positions
-            st.divider()
-            st.subheader("Current Positions")
-            positions = state.get("positions", {})
-            if positions:
-                pos_df = pd.DataFrame([
-                    {"Ticker": ticker, "Shares": qty}
-                    for ticker, qty in positions.items()
-                    if qty > 0.001
-                ])
-                if not pos_df.empty:
-                    st.dataframe(pos_df, hide_index=True, use_container_width=True)
-                else:
-                    st.info("No open positions")
-            else:
-                st.info("No positions held")
-            
-            # Fees
-            fees = state.get("fees_paid", 0)
-            if fees > 0:
-                st.caption(f"Total fees paid: ${fees:,.2f}")
-        else:
-            st.info("No portfolio state available")
-    else:
-        st.info("👈 Run the strategy engine to see portfolio state")
-
-# ---------------------------------------------------------
-# Tab 8: Performance (Layer 12)
-# ---------------------------------------------------------
-with tab_performance:
-    st.header("📈 Performance Metrics")
-    
-    result = st.session_state.result
-    
-    if result:
-        if result.portfolio_state:
-            state = result.portfolio_state
-            
-            # Performance summary
-            col1, col2, col3 = st.columns(3)
-            
-            realized_pnl = state.get("realized_pnl", 0)
-            initial_capital = capital  # From sidebar input
-            pnl_pct = (realized_pnl / initial_capital) * 100 if initial_capital else 0
-            
-            col1.metric("Realized P&L", f"${realized_pnl:,.2f}", f"{pnl_pct:+.2f}%")
-            col2.metric("Unrealized P&L", f"${state.get('unrealized_pnl', 0):,.2f}")
-            col3.metric("Total Trades", state.get("num_trades", 0))
-            
-            st.divider()
-            
-            # Strategy info
-            st.subheader("Strategy Summary")
-            st.markdown(f"""
-            | Metric | Value |
-            |--------|-------|
-            | **Selected Strategy** | {result.selected_strategy} |
-            | **Dominant Regime** | {result.dominant_regime} |
-            | **Execution Time** | {result.execution_time_ms:.0f}ms |
-            """)
-            
-            # Bandit scores
-            if result.bandit_scores:
-                st.divider()
-                st.subheader("Strategy Scores (Bandit)")
-                scores_df = pd.DataFrame([
-                    {"Strategy": k, "Score": v} 
-                    for k, v in result.bandit_scores.items()
-                ]).sort_values("Score", ascending=False)
-                
-                fig = px.bar(
-                    scores_df, x="Strategy", y="Score", 
-                    color="Score", color_continuous_scale="Viridis",
-                    title="Bandit Strategy Scores"
-                )
-                fig.update_layout(height=300, showlegend=False)
-                st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Performance metrics require portfolio data")
-    else:
-        st.info("👈 Run the strategy engine to see performance metrics")
-
-# ---------------------------------------------------------
-# Tab 9: History (3 Tables: Signals, Transactions, Cycles)
+# Tab 7: History (Portfolio + Performance + Trading Logs)
 # ---------------------------------------------------------
 with tab_history:
-    st.header("📜 Trading History")
-    st.caption("Persistent logs of all trading activity")
+    st.header("📜 History & Performance")
     
-    # --- Table 1: Generated Signal History ---
-    with st.expander("📊 Signal History (Generated Signals)", expanded=True):
+    result = st.session_state.result
+    
+    # --- Portfolio State ---
+    if result and result.portfolio_state:
+        state = result.portfolio_state
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        realized_pnl = state.get("realized_pnl", 0)
+        pnl_pct = (realized_pnl / capital) * 100 if capital else 0
+        
+        col1.metric("💵 Cash", f"${state.get('cash', 0):,.2f}")
+        col2.metric("📈 Realized P&L", f"${realized_pnl:,.2f}", f"{pnl_pct:+.2f}%")
+        col3.metric("📊 Unrealized P&L", f"${state.get('unrealized_pnl', 0):,.2f}")
+        col4.metric("🔄 Total Trades", state.get("num_trades", 0))
+        
+        # Current positions
+        positions = state.get("positions", {})
+        if positions:
+            pos_items = [{"Ticker": t, "Shares": q} for t, q in positions.items() if q > 0.001]
+            if pos_items:
+                st.divider()
+                st.subheader("Current Positions")
+                st.dataframe(pd.DataFrame(pos_items), hide_index=True, use_container_width=True)
+        
+        fees = state.get("fees_paid", 0)
+        if fees > 0:
+            st.caption(f"Total fees paid: ${fees:,.2f}")
+    
+    st.divider()
+    
+    # --- Trading Logs (3 tables) ---
+    st.subheader("📋 Trading Logs")
+    
+    # Signal History
+    with st.expander("📊 Signal History", expanded=False):
         history_df = get_signal_history()
         if not history_df.empty:
             st.dataframe(
                 history_df.sort_values("Timestamp", ascending=True) if "Timestamp" in history_df.columns else history_df,
-                use_container_width=True,
-                height=300
+                use_container_width=True, height=250
             )
         else:
-            st.info("No signal history yet. Run the engine to generate signals.")
+            st.info("No signal history yet.")
     
-    # --- Table 2: Backtest Transactions ---
-    with st.expander("💰 Backtest Transactions (Trade Details)", expanded=True):
+    # Transaction History
+    with st.expander("💰 Transactions", expanded=False):
         transactions_df = get_transaction_history()
         if not transactions_df.empty:
-            # Summary metrics
             col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Total Trades", len(transactions_df))
-            with col2:
-                total_cost = transactions_df["Transaction_Cost"].sum() if "Transaction_Cost" in transactions_df.columns else 0
-                st.metric("Total Costs", f"${total_cost:.2f}")
-            with col3:
-                # Support both "Side" and "Action" columns
-                act_col = "Side" if "Side" in transactions_df.columns else "Action"
-                buy_count = len(transactions_df[transactions_df[act_col] == "BUY"]) if act_col in transactions_df.columns else 0
-                st.metric("Buys", buy_count)
-            with col4:
-                act_col = "Side" if "Side" in transactions_df.columns else "Action"
-                sell_count = len(transactions_df[transactions_df[act_col] == "SELL"]) if act_col in transactions_df.columns else 0
-                st.metric("Sells", sell_count)
+            col1.metric("Total Trades", len(transactions_df))
+            total_cost = transactions_df["Transaction_Cost"].sum() if "Transaction_Cost" in transactions_df.columns else 0
+            col2.metric("Total Costs", f"${total_cost:.2f}")
+            act_col = "Side" if "Side" in transactions_df.columns else "Action"
+            buy_count = len(transactions_df[transactions_df[act_col] == "BUY"]) if act_col in transactions_df.columns else 0
+            col3.metric("Buys", buy_count)
+            sell_count = len(transactions_df[transactions_df[act_col] == "SELL"]) if act_col in transactions_df.columns else 0
+            col4.metric("Sells", sell_count)
             
             st.dataframe(
                 transactions_df.sort_values("Timestamp", ascending=True) if "Timestamp" in transactions_df.columns else transactions_df,
-                use_container_width=True,
-                height=300
+                use_container_width=True, height=250
             )
         else:
-            st.info("No transaction history yet.")
+            st.info("No transactions yet.")
     
-    # --- Table 3: Rebalance Cycle Summary ---
-    with st.expander("🔄 Rebalance Cycles (P&L Summary)", expanded=True):
+    # Rebalance Cycles
+    with st.expander("🔄 Rebalance Cycles", expanded=False):
         cycles_df = get_cycle_history()
         if not cycles_df.empty:
-            # Summary metrics
             col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Total Cycles", len(cycles_df))
-            with col2:
-                total_costs = cycles_df["Transaction_Costs"].sum() if "Transaction_Costs" in cycles_df.columns else 0
-                st.metric("Total Costs", f"${total_costs:.2f}")
-            with col3:
-                latest_value = cycles_df["Current_Position"].iloc[-1] if "Current_Position" in cycles_df.columns else 0
-                st.metric("Latest Position", f"${latest_value:,.2f}")
-            with col4:
-                total_pnl = cycles_df["P/L"].sum() if "P/L" in cycles_df.columns else 0
-                st.metric("Total P/L", f"${total_pnl:,.2f}")
+            col1.metric("Total Cycles", len(cycles_df))
+            total_costs = cycles_df["Transaction_Costs"].sum() if "Transaction_Costs" in cycles_df.columns else 0
+            col2.metric("Total Costs", f"${total_costs:.2f}")
+            latest_value = cycles_df["Current_Position"].iloc[-1] if "Current_Position" in cycles_df.columns else 0
+            col3.metric("Latest Position", f"${latest_value:,.2f}")
+            total_pnl = cycles_df["P/L"].sum() if "P/L" in cycles_df.columns else 0
+            col4.metric("Total P/L", f"${total_pnl:,.2f}")
             
-            st.dataframe(
-                cycles_df,
-                use_container_width=True,
-                height=200
-            )
+            st.dataframe(cycles_df, use_container_width=True, height=200)
         else:
             st.info("No rebalance cycles yet.")
 
 # ---------------------------------------------------------
-# Sidebar — Action buttons at bottom
+# Sidebar — Reset Button
 # ---------------------------------------------------------
 st.sidebar.divider()
-if st.sidebar.button("🔄 Reset All", use_container_width=True):
-    # 1. Clear persist logs using module functions (guarantees correct path)
+if st.sidebar.button("🔄 Reset All", width="stretch"):
+    # Clear trading logs
     clear_signal_log()
     clear_transaction_log()
     clear_cycle_log()
     
-    # 2. Also try to clean up the logs dir physically as a fallback
-    import shutil
-    import os
-    import time
-    try:
-        if os.path.exists("logs"):
-            shutil.rmtree("logs")
-            time.sleep(0.2)
-    except Exception:
-        pass
+    import shutil, os
+    if os.path.exists("logs"):
+        shutil.rmtree("logs")
     
-    # 3. Clear all session state
+    # All bandit state (A, B, C) is PRESERVED — learned knowledge survives resets
+    
+    # Clear session state and caches
     st.session_state.clear()
-    
-    # 4. Clear cache to prevent stale data re-load
     st.cache_data.clear()
     st.cache_resource.clear()
-    
-    # 5. Rerun
     st.rerun()
 

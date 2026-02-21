@@ -17,6 +17,7 @@ plotly
 
 # Utility
 tqdm
+pyyaml
 
 # SUP Flow 1 - ML Components
 hmmlearn>=0.3.0    # Gaussian HMM for regime detection
