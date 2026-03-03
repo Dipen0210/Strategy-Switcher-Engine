@@ -580,14 +580,6 @@ with tab_strategy:
     result = st.session_state.result
     
     if result:
-        # Header metrics
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Primary Strategy", result.selected_strategy)
-        col2.metric("Regime", result.dominant_regime)
-        col3.metric("Execution Time", f"{result.execution_time_ms:.0f}ms")
-        
-        st.divider()
-        
         # Per-stock strategy assignment table
         if result.per_stock_strategies:
             st.subheader("Per-Stock Strategy Assignment")
@@ -611,22 +603,11 @@ with tab_strategy:
                     "θ_C": f"{theta_c:.3f}",
                     "HMM Conf": f"{hmm_conf:.1%}",
                     "Stability": f"{stab:.2f}",
-                    "# Available": len(allowed),
                 })
             
             strategy_df = pd.DataFrame(strategy_data)
             st.dataframe(strategy_df, hide_index=True, use_container_width=True)
         
-        # Strategy switch decision
-        if result.switch_decision:
-            st.divider()
-            st.subheader("🔄 Strategy Switch Decision")
-            switch = result.switch_decision
-            if hasattr(switch, 'should_switch'):
-                if switch.should_switch:
-                    st.success(f"✅ Strategy switch approved: {switch.reason if hasattr(switch, 'reason') else ''}")
-                else:
-                    st.warning(f"⏸️ Strategy switch blocked: {switch.reason if hasattr(switch, 'reason') else 'Cooldown/threshold'}")
     else:
         st.info("👈 Run the engine to see strategy selection")
 
