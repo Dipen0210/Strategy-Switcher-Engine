@@ -116,29 +116,38 @@ Each strategy defines its own `TIMEFRAME` lookback period:
 
 ### Demo
 
-<img width="1251" height="303" alt="Screenshot 2026-03-20 at 5 58 40 PM" src="https://github.com/user-attachments/assets/bddcea8b-4c02-47c7-9c42-9254e463e339" />
-
-<img width="1254" height="618" alt="Screenshot 2026-03-20 at 5 58 33 PM" src="https://github.com/user-attachments/assets/12ba3f30-8b3c-4f60-8f4e-8f70feff1dbb" />
-
-<img width="1243" height="432" alt="Screenshot 2026-03-20 at 5 58 01 PM" src="https://github.com/user-attachments/assets/9bc809c7-f30a-4796-985f-9227b74806a2" />
-
-<img width="1250" height="721" alt="Screenshot 2026-03-20 at 5 57 51 PM" src="https://github.com/user-attachments/assets/bb2f3970-e01d-4e8c-913f-f25c5a519b2d" />
-
-<img width="1250" height="636" alt="Screenshot 2026-03-20 at 5 57 42 PM" src="https://github.com/user-attachments/assets/787002fa-2b8c-412e-85dd-0c2ef9ed7261" />
-
-<img width="1253" height="274" alt="Screenshot 2026-03-20 at 5 57 35 PM" src="https://github.com/user-attachments/assets/f4479d24-fbc0-452a-9eb9-601d4c48795e" />
-
-<img width="1250" height="662" alt="Screenshot 2026-03-20 at 5 57 27 PM" src="https://github.com/user-attachments/assets/566f6879-2493-4000-ad52-2782d960a128" />
-
-<img width="1249" height="679" alt="Screenshot 2026-03-20 at 5 57 17 PM" src="https://github.com/user-attachments/assets/9bbabb79-be16-4958-b126-e51496f01024" />
-
-<img width="1246" height="580" alt="Screenshot 2026-03-20 at 5 56 43 PM" src="https://github.com/user-attachments/assets/37249ecf-ec3c-47a7-8907-5d42608b2bca" />
+<img width="1470" height="752" alt="Screenshot 2026-03-20 at 5 59 32 PM" src="https://github.com/user-attachments/assets/10cd3d2c-c4e8-4648-86f5-87d922d1811c" />
 
 <img width="1248" height="530" alt="Screenshot 2026-03-20 at 5 56 21 PM" src="https://github.com/user-attachments/assets/746c500d-77df-4c79-866e-35929dcc2e18" />
 
-<img width="1293" height="355" alt="Screenshot 2026-03-12 at 12 01 48 PM" src="https://github.com/user-attachments/assets/e53d1fb7-00fc-451c-a752-cc99243f6c17" />
+<img width="1246" height="580" alt="Screenshot 2026-03-20 at 5 56 43 PM" src="https://github.com/user-attachments/assets/37249ecf-ec3c-47a7-8907-5d42608b2bca" />
 
-<img width="1470" height="752" alt="Screenshot 2026-03-20 at 5 59 32 PM" src="https://github.com/user-attachments/assets/10cd3d2c-c4e8-4648-86f5-87d922d1811c" />
+<img width="1249" height="679" alt="Screenshot 2026-03-20 at 5 57 17 PM" src="https://github.com/user-attachments/assets/9bbabb79-be16-4958-b126-e51496f01024" />
+
+<img width="1250" height="662" alt="Screenshot 2026-03-20 at 5 57 27 PM" src="https://github.com/user-attachments/assets/566f6879-2493-4000-ad52-2782d960a128" />
+
+<img width="1253" height="274" alt="Screenshot 2026-03-20 at 5 57 35 PM" src="https://github.com/user-attachments/assets/f4479d24-fbc0-452a-9eb9-601d4c48795e" />
+
+<img width="1250" height="636" alt="Screenshot 2026-03-20 at 5 57 42 PM" src="https://github.com/user-attachments/assets/787002fa-2b8c-412e-85dd-0c2ef9ed7261" />
+
+<img width="1250" height="721" alt="Screenshot 2026-03-20 at 5 57 51 PM" src="https://github.com/user-attachments/assets/bb2f3970-e01d-4e8c-913f-f25c5a519b2d" />
+
+<img width="1243" height="432" alt="Screenshot 2026-03-20 at 5 58 01 PM" src="https://github.com/user-attachments/assets/9bc809c7-f30a-4796-985f-9227b74806a2" />
+
+<img width="1254" height="618" alt="Screenshot 2026-03-20 at 5 58 33 PM" src="https://github.com/user-attachments/assets/12ba3f30-8b3c-4f60-8f4e-8f70feff1dbb" />
+
+<img width="1251" height="303" alt="Screenshot 2026-03-20 at 5 58 40 PM" src="https://github.com/user-attachments/assets/bddcea8b-4c02-47c7-9c42-9254e463e339" />
+
+
+
+
+
+
+
+
+
+
+
 
 ---
 
