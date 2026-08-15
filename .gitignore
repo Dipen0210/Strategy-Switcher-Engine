@@ -19,3 +19,12 @@ dist/
 .claude/
 .gemini/
 .cursor/    
+# Backtest artifacts
+backtest/_cache/
+backtest/results/
+.papers/
+# Excluded from publication by request
+SUCCESS_CRITERIA.md
+paper/
+run_all.py
+results_UNFROZEN_do_not_cite/

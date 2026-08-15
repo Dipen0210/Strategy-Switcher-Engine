@@ -1,0 +1,101 @@
+{
+  "generated": "2026-08-14T19:36:02",
+  "tables": {
+    "stage0_leakage": {
+      "rows": 4,
+      "note": "look-ahead suite; all must pass"
+    },
+    "stage1_dev_grid": {
+      "rows": 6,
+      "note": "searched on 2005-01-01..2014-12-31; 6 configurations"
+    },
+    "stage1_frozen_params": {
+      "kind": "json"
+    },
+    "stage2_ablations": {
+      "rows": 7,
+      "note": "mean +/- std across 20 seeds, frozen params"
+    },
+    "stage2_baselines": {
+      "rows": 3,
+      "note": "identical dates, costs and execution path"
+    },
+    "stage2_per_seed": {
+      "rows": 140,
+      "note": "every individual run, for full reproducibility"
+    },
+    "stage3_bootstrap_ci": {
+      "rows": 1,
+      "note": "Politis-Romano stationary bootstrap, mean block 21, 10,000 resamples"
+    },
+    "stage3_ledoit_wolf": {
+      "rows": 3,
+      "note": "Ledoit-Wolf (2008) studentized bootstrap; p reported as-is including non-significant"
+    },
+    "stage5_sensitivity": {
+      "rows": 10,
+      "note": "5 seeds per point, frozen params"
+    },
+    "stage6_subperiods": {
+      "rows": 50,
+      "note": "contiguous partition of the evaluation window"
+    }
+  },
+  "incomplete": [],
+  "gates": [
+    {
+      "name": "Buy-Hold SPX CAGR 2015-2025",
+      "passed": true,
+      "observed": "13.57%",
+      "expected": "~11-13% (accept 10-14%)"
+    },
+    {
+      "name": "Buy-Hold SPX MaxDD (COVID)",
+      "passed": true,
+      "observed": "-33.7%",
+      "expected": "~-34% (accept -42%..-28%)"
+    },
+    {
+      "name": "OOS CAGR vs prior full-sample 11.8%",
+      "passed": true,
+      "observed": "10.78%",
+      "expected": "<= 11.8%"
+    },
+    {
+      "name": "OOS Sharpe ceiling",
+      "passed": true,
+      "observed": "0.94",
+      "expected": "<= 1.40"
+    },
+    {
+      "name": "OOS MaxDD floor",
+      "passed": true,
+      "observed": "-15.0%",
+      "expected": "worse than -10%"
+    },
+    {
+      "name": "OOS win rate ceiling",
+      "passed": true,
+      "observed": "54.9%",
+      "expected": "<= 58%"
+    },
+    {
+      "name": "Seed variance non-zero",
+      "passed": true,
+      "observed": "Sharpe std = 0.0616",
+      "expected": "> 0"
+    },
+    {
+      "name": "Seed variance not excessive",
+      "passed": true,
+      "observed": "Sharpe std = 0.0616",
+      "expected": "<= 0.25"
+    },
+    {
+      "name": "Cost sensitivity 5->20bps",
+      "passed": false,
+      "observed": "9.35 pp drop",
+      "expected": "<= 5 pp"
+    }
+  ]
+}

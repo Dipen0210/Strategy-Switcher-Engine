@@ -152,6 +152,62 @@ def get_strategy_runner(strategy_spec: StrategySpec) -> StrategyRunner:
         )
 
 
+def run_single_strategy(
+    spec: StrategySpec,
+    stock_data_dict: dict[str, pd.DataFrame],
+) -> List[StrategyOutput]:
+    """
+    Run ONE strategy and return its outputs in the standard format.
+
+    Split out of run_strategies_for_regime so that callers which need a single
+    strategy — notably the per-strategy signal replay in L6 scoring — get the
+    identical legacy-DataFrame conversion instead of reimplementing it and
+    quietly diverging.
+
+    Raises on strategy failure; callers decide whether to skip or propagate.
+    """
+    runner = get_strategy_runner(spec)
+    outputs = runner(stock_data_dict)
+
+    # New-style strategies already return List[StrategyOutput]
+    if not (spec.legacy and isinstance(outputs, pd.DataFrame)):
+        return list(outputs)
+
+    # Legacy strategies return a DataFrame; convert it.
+    if "Ticker" in outputs.columns:
+        outputs = outputs.set_index("Ticker")
+
+    converted: List[StrategyOutput] = []
+    for ticker in stock_data_dict.keys():
+        if ticker not in outputs.index:
+            continue
+
+        # Handle different score column names
+        score = 0.5
+        if "score" in outputs.columns:
+            score = outputs.loc[ticker, "score"]
+        elif "Strategy_Score" in outputs.columns:
+            raw_score = outputs.loc[ticker, "Strategy_Score"]
+            # Normalize -1 to 1 range to 0 to 1
+            score = (raw_score + 1) / 2
+
+        # Generate signal based on normalized score (0 to 1)
+        # > 0.6 = BUY, < 0.4 = SELL, else HOLD
+        signal = 1 if score > 0.6 else (-1 if score < 0.4 else 0)
+        confidence = abs(score - 0.5) * 2
+
+        converted.append(StrategyOutput(
+            ticker=ticker,
+            signal=signal,
+            confidence=confidence,
+            strategy_name=spec.name,
+            pod=spec.pod,
+            regime=spec.regime,
+        ))
+
+    return converted
+
+
 def run_strategies_for_regime(
     regime: str,
     stock_data_dict: dict[str, pd.DataFrame],
@@ -159,66 +215,29 @@ def run_strategies_for_regime(
 ) -> List[StrategyOutput]:
     """
     Run all strategies for a regime and collect outputs.
-    
+
     Args:
         regime: Current regime
         stock_data_dict: Dict of ticker -> OHLCV DataFrame
         strategy_filter: Optional list of strategy names to run (for L4.5 filtering)
-    
+
     Returns:
         List of StrategyOutput from all strategies
     """
     specs = get_strategies_for_regime(regime)
-    
+
     if strategy_filter:
         specs = [s for s in specs if s.name in strategy_filter]
-    
+
     all_outputs = []
-    
+
     for spec in specs:
         try:
-            runner = get_strategy_runner(spec)
-            outputs = runner(stock_data_dict)
-            
-            # Handle legacy strategies that return DataFrame instead of StrategyOutput
-            if spec.legacy and isinstance(outputs, pd.DataFrame):
-                # Ensure Ticker is the index
-                if "Ticker" in outputs.columns:
-                    outputs = outputs.set_index("Ticker")
-                
-                # Convert legacy output to StrategyOutput
-                for ticker in stock_data_dict.keys():
-                    if ticker in outputs.index:
-                        # Handle different score column names
-                        score = 0.5
-                        if "score" in outputs.columns:
-                            score = outputs.loc[ticker, "score"]
-                        elif "Strategy_Score" in outputs.columns:
-                            raw_score = outputs.loc[ticker, "Strategy_Score"]
-                            # Normalize -1 to 1 range to 0 to 1
-                            score = (raw_score + 1) / 2
-                        
-                        # Generate signal based on normalized score (0 to 1)
-                        # > 0.6 = BUY, < 0.4 = SELL, else HOLD
-                        signal = 1 if score > 0.6 else (-1 if score < 0.4 else 0)
-                        confidence = abs(score - 0.5) * 2
-                        
-                        all_outputs.append(StrategyOutput(
-                            ticker=ticker,
-                            signal=signal,
-                            confidence=confidence,
-                            strategy_name=spec.name,
-                            pod=spec.pod,
-                            regime=spec.regime,
-                        ))
-            else:
-                # New-style strategies return List[StrategyOutput]
-                all_outputs.extend(outputs)
-                
+            all_outputs.extend(run_single_strategy(spec, stock_data_dict))
         except Exception as e:
             print(f"Warning: Strategy '{spec.name}' failed: {e}")
             continue
-    
+
     return all_outputs
 
 

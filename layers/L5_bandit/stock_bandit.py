@@ -40,6 +40,8 @@ class StockBandit:
     ticker: str
     regime: str = ""
     strategies: dict[str, float] = field(default_factory=dict)
+    # Sensitivity-sweep knob; see GlobalBandit.decay_factor.
+    decay_factor: float = DECAY_FACTOR
 
     def _ensure_strategies(self, strategy_names: list[str]) -> None:
         """Ensure all candidates are initialized with random unequal weights."""
@@ -84,7 +86,8 @@ class StockBandit:
         
         for k in self.strategies:
             current = self.strategies[k]
-            self.strategies[k] = (current * DECAY_FACTOR) + (uniform_weight * (1.0 - DECAY_FACTOR))
+            delta = getattr(self, "decay_factor", DECAY_FACTOR)
+            self.strategies[k] = (current * delta) + (uniform_weight * (1.0 - delta))
             
         self._normalize()
 
@@ -151,6 +154,13 @@ class StockBanditManager:
         """Convert key to safe filename."""
         return key.replace("/", "_").replace(".", "_").replace(" ", "-")
 
+    def set_hyperparameters(self, decay_factor=None) -> None:
+        """Sensitivity-sweep override applied to existing and future bandits."""
+        if decay_factor is not None:
+            self.decay_factor = float(decay_factor)
+            for bandit in self.bandits.values():
+                bandit.decay_factor = self.decay_factor
+
     def get_bandit(self, ticker: str, regime: str = "") -> StockBandit:
         """Get or lazily load/create a stock-regime bandit."""
         key = self._make_key(ticker, regime)
@@ -167,6 +177,9 @@ class StockBanditManager:
                 self.bandits[key] = bandit
             else:
                 self.bandits[key] = StockBandit(ticker=ticker.upper(), regime=regime)
+
+        if getattr(self, "decay_factor", None) is not None:
+            self.bandits[key].decay_factor = self.decay_factor
 
         return self.bandits[key]
 

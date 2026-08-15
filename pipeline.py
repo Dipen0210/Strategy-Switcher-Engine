@@ -35,16 +35,21 @@ from layers.L2_regime_intelligence.regime_selection import (
     blend_regime, compute_stability, REGIME_STRATEGY_COMPAT
 )
 from layers.L3_strategy_universe import STRATEGY_REGISTRY, get_all_strategy_dicts, get_strategies_for_regime, run_strategies_for_regime
-from layers.L7_position_sizing import compute_position_sizes
+from layers.L3_strategy_universe.registry import run_single_strategy
+from layers.L7_position_sizing import compute_position_sizes, signal_participation
 from layers.L8_signal_generation import generate_portfolio_signals, log_signals
-from layers.L9_execution_scheduler import StrategySwitchManager
+from layers.L9_execution_scheduler import StrategySwitchManager, SwitchDecision
 from layers.L10_trade_execution import run_execution_cycle, log_transactions_from_fills, snapshot_prices
 from layers.L11_rebalancing import PortfolioState, log_cycle_summary, get_latest_cycle_number
 from layers.L12_performance_benchmark import PerformanceMonitor, DecisionExplanation
 
 # Hierarchical Bandit System (persistent across restarts)
 from layers.L5_bandit import BanditPersistenceManager
-from layers.L5_bandit.reward import compute_reward
+from layers.L5_bandit.reward import (
+    compute_reward,
+    attributable_return,
+    differentiated_exp3_rewards,
+)
 
 
 def get_next_trading_day(date_str: str) -> str:
@@ -78,6 +83,7 @@ class PipelineResult:
     portfolio_state: Optional[dict] = None
     execution_time_ms: float = 0.0
     switch_decision: Optional[object] = None
+    emergency_triggered: bool = False  # L0 kill switch fired this cycle
 
 
 class StrategyEngine:
@@ -85,8 +91,67 @@ class StrategyEngine:
     Main Strategy Engine orchestrating all 13 layers (0-12).
     """
     
-    def __init__(self, policy: Optional[UserPolicy] = None):
+    def __init__(self, policy: Optional[UserPolicy] = None, bandit_dir=None,
+                 use_garch: bool = True, logging_enabled: bool = True):
         self.policy = policy
+        # GARCH dominates per-cycle cost; backtests disable it and fall back
+        # to realized volatility for the L7 forecast.
+        self.use_garch = use_garch
+        # CSV trade/cycle logging does a read-modify-write per call, which is
+        # both slow and polluting across thousands of backtest cycles. The UI
+        # keeps it on; the harness turns it off and records its own artifacts.
+        self.logging_enabled = logging_enabled
+
+        # --- Ablation switches -------------------------------------------
+        # Defaults reproduce the full engine exactly. backtest.ablations flips
+        # these to isolate the contribution of individual components; keeping
+        # them as explicit options avoids monkeypatching core decision logic,
+        # which would make ablation results hard to trust.
+        #
+        # blend_weights: (w_global, w_hmm) for Bandit A regime blending.
+        #   (0.0, 1.0) disables Bandit A — raw HMM posteriors are used.
+        self.blend_weights = (0.60, 0.40)
+        # strategy_pool: "regime" restricts candidates to the detected
+        #   regime's pod (10 strategies). "all" pools all 40 regardless of
+        #   regime — the flat-bandit comparison for the pod hypothesis.
+        self.strategy_pool = "regime"
+        # use_signal_participation: False reverts to the pre-fix behavior
+        #   where the winning strategy's signal did not affect position size.
+        self.use_signal_participation = True
+        # score_weights: (theta_B, normalized past return, theta_C) blend used
+        #   to pick the winning strategy. Hardcoded as 0.3/0.4/0.3 before;
+        #   exposed so it can be tuned on the validation window only.
+        self.score_weights = (0.3, 0.4, 0.3)
+        # confidence_gate: blended posterior below which a regime call is
+        #   flagged ambiguous.
+        self.confidence_gate = 0.55
+        # past_return_mode: how the middle term of the selection score is
+        #   computed. See _strategy_past_sharpe for why "stock" is broken.
+        #     "strategy" — replay the strategy's OWN signals over its
+        #                  TIMEFRAME and score the returns they produced.
+        #     "stock"    — legacy behavior: the STOCK's trailing Sharpe over
+        #                  the strategy's TIMEFRAME. Identical for any two
+        #                  strategies sharing a timeframe, so it cannot rank
+        #                  them. Kept only as an ablation arm.
+        #     "off"      — drop the term; theta_B and theta_C are renormalized
+        #                  to carry its weight.
+        self.past_return_mode = "strategy"
+        # Replay cost control. Signals are cached per (strategy, ticker, date)
+        # so consecutive cycles reuse overlapping windows.
+        self.past_return_max_evals = 60
+        self._signal_replay_cache: Dict[tuple, tuple] = {}
+        # fully_invested: True renormalizes target weights to sum to 1.0, i.e.
+        #   the book is always 100% deployed. False lets conviction and the
+        #   risk caps actually reduce exposure, holding the remainder in cash.
+        #
+        #   Default True. NOTE the tradeoff: renormalizing restores full
+        #   deployment but also rescales away part of the volatility and
+        #   leverage caps, since a book cut to 0.6 gross by those caps is
+        #   pushed back to 1.0. Relative weights still reflect conviction, but
+        #   the portfolio can no longer de-risk into cash. Treat this as a
+        #   tuned hyperparameter (it is in backtest.tuning's grid), not a
+        #   setting to fix by inspecting test-period results.
+        self.fully_invested = True
         
         # State-persistent layers
         self.regime_manager = RegimeManager()                  # L2
@@ -96,31 +161,168 @@ class StrategyEngine:
         self.portfolio_state = PortfolioState(cash=initial_capital, initial_capital=initial_capital)  # L11 State
         self.monitor = PerformanceMonitor()                     # L12
         
-        # Hierarchical Bandit System (persistent across restarts)
-        self.ensemble_bandits = BanditPersistenceManager.load()  # L5 (Global + Regime + Stock)
+        # Hierarchical Bandit System (persistent across restarts).
+        # bandit_dir lets a backtest isolate learned state per run.
+        self.ensemble_bandits = BanditPersistenceManager.load(base_dir=bandit_dir)  # L5
         
         self.current_strategy: Optional[str] = None
-        
+
         # Tracking for post-trade feedback
         self.last_decisions: Dict[str, str] = {}    # Ticker → Strategy Name
         self.last_regime: Optional[str] = None       # For transition detection
+        # Captured at decision time so the NEXT cycle can attribute the
+        # realized move to the strategy that chose the exposure.
+        self.last_participation: Dict[str, float] = {}   # Ticker → [0, 1]
+        self.last_prices: Dict[str, float] = {}          # Ticker → close at T
+        self.last_ambiguous: Dict[str, bool] = {}        # Ticker → regime uncertain
     
     def set_policy(self, policy: UserPolicy) -> None:
         self.policy = policy
         # Initialize portfolio state with policy capital
         self.portfolio_state = PortfolioState(cash=policy.total_capital)
-    
+
+    # ------------------------------------------------------------------
+    # Per-strategy historical performance (middle term of the L6 score)
+    # ------------------------------------------------------------------
+
+    def _replayed_signal(self, spec, ticker: str, df: pd.DataFrame) -> tuple:
+        """
+        Signal/confidence the strategy would have emitted on the LAST bar of df.
+
+        Cached on (strategy, ticker, last date) because consecutive cycles
+        replay heavily overlapping windows — without this the replay would
+        recompute the same signals every week.
+        """
+        last_date = df["Date"].iloc[-1] if "Date" in df.columns else df.index[-1]
+        key = (spec.name, ticker, pd.Timestamp(last_date))
+
+        cached = self._signal_replay_cache.get(key)
+        if cached is not None:
+            return cached
+
+        try:
+            outputs = run_single_strategy(spec, {ticker: df})
+        except Exception:
+            outputs = []
+
+        result = (0, 0.0)
+        for out in outputs:
+            if out.ticker == ticker:
+                result = (out.signal, out.confidence)
+                break
+
+        self._signal_replay_cache[key] = result
+        return result
+
+    def _strategy_past_sharpe(self, spec, ticker: str, df: pd.DataFrame,
+                              timeframe: int) -> float:
+        """
+        Risk-adjusted return the STRATEGY itself produced over its TIMEFRAME.
+
+        Why this replaces the old computation
+        -------------------------------------
+        The previous version computed the Sharpe ratio of the STOCK over the
+        last `timeframe` bars. That value depends only on (ticker, timeframe)
+        — never on the strategy — so any two candidates sharing a timeframe
+        received identical scores and the term could not rank them. Bull-
+        Volatile has six of ten strategies at timeframe=20, so when the top-5
+        candidates tied, min == max, the normalizer fell back to a range of
+        1.0, and every candidate scored exactly 0.0. Forty percent of the
+        selection score was then a constant.
+
+        This version replays the strategy's own decisions: for each bar in the
+        lookback it recomputes the signal from data up to that bar only, then
+        scores the next bar's return by how far the signal deviated from a
+        neutral stance — the same attribution the bandits are rewarded on, so
+        the scorer and the reward measure the same quantity.
+
+        Look-ahead: bar i uses df[:i+1] to decide and (i -> i+1) to score, and
+        i+1 never exceeds the last row of df. Since df is already the decision
+        slice (dates <= T), nothing after T is touched.
+        """
+        if "Close" not in df.columns or len(df) < 3:
+            return 0.0
+
+        # Need one extra bar to realize the final decision's return.
+        n_eval = min(int(timeframe), len(df) - 1, int(self.past_return_max_evals))
+        if n_eval < 2:
+            return 0.0
+
+        closes = df["Close"].to_numpy(dtype=float)
+        start = len(df) - 1 - n_eval
+
+        attributed = []
+        for i in range(start, len(df) - 1):
+            if closes[i] <= 0:
+                continue
+            signal, confidence = self._replayed_signal(spec, ticker, df.iloc[:i + 1])
+            participation = signal_participation(signal, confidence)
+            fwd_return = (closes[i + 1] - closes[i]) / closes[i]
+            attributed.append(attributable_return(participation, fwd_return))
+
+        if len(attributed) < 2:
+            return 0.0
+
+        arr = np.asarray(attributed, dtype=float)
+        std = float(arr.std())
+        if std < 1e-9:
+            # A strategy that never took a position has no risk-adjusted
+            # record to speak of; score it neutral rather than infinite.
+            return 0.0
+
+        return float(arr.mean() / std) * float(np.sqrt(252))
+
+    def _stock_past_sharpe(self, df: pd.DataFrame, timeframe: int) -> float:
+        """Legacy term: the STOCK's trailing Sharpe. Ablation arm only."""
+        if "Close" not in df.columns or len(df) < timeframe:
+            return 0.0
+        closes = df["Close"].to_numpy(dtype=float)[-int(timeframe):]
+        if len(closes) <= 1:
+            return 0.0
+        daily = np.diff(closes) / closes[:-1]
+        std = float(np.std(daily))
+        if std <= 1e-6:
+            return 0.0
+        return float(np.mean(daily) / std) * float(np.sqrt(252))
+
     def run(
         self,
         stock_data_dict: Dict[str, pd.DataFrame],
         user_weights: Optional[pd.Series] = None,
         current_date: Optional[str] = None,
+        execution_data_dict: Optional[Dict[str, pd.DataFrame]] = None,
+        commission_per_trade: float = 1.0,
+        cost_bps: float = 0.0,
+        execution_date: Optional[str] = None,
     ) -> PipelineResult:
+        """
+        Run one full decision + execution cycle.
+
+        Args:
+            stock_data_dict: DECISION data. Must contain no bars after
+                `current_date` — everything the model sees for regime
+                detection, strategy evaluation and sizing comes from here.
+            current_date: signal date T (decisions use closes through T).
+            execution_data_dict: EXECUTION data, which must additionally
+                contain the T+1 bar so fills can occur at the next session's
+                open. Kept separate from decision data so a backtest can
+                enforce point-in-time discipline: withholding T+1 from the
+                decision path is what prevents the engine from seeing its own
+                execution bar. Defaults to stock_data_dict (live/UI use,
+                where the frame ends at the last available bar anyway).
+            commission_per_trade: flat per-fill commission in currency units.
+            cost_bps: proportional cost in basis points of traded notional
+                (bid-ask/slippage proxy). Total fee = commission + bps.
+        """
         start_time = time.time()
         current_date_str = current_date or datetime.now().strftime("%Y-%m-%d")
         
         if self.policy is None:
             raise ValueError("Policy not set. Call set_policy() first.")
+
+        # Execution may see one extra bar (T+1) that the decision path must not.
+        if execution_data_dict is None:
+            execution_data_dict = stock_data_dict
         
         # === 0. USER & POLICY ===
         if user_weights is None:
@@ -132,7 +334,9 @@ class StrategyEngine:
         enriched_data = {}
         for ticker, df in stock_data_dict.items():
             if df is not None and not df.empty:
-                enriched_data[ticker] = compute_all_features(df)
+                enriched_data[ticker] = compute_all_features(
+                    df, use_garch=getattr(self, "use_garch", True)
+                )
                 
         # === 1.5 POST-MARKET FEEDBACK (from previous cycle) ===
         # Update bandits based on how our LAST decisions performed
@@ -158,22 +362,51 @@ class StrategyEngine:
             
             # Force Liquidation
             selected_strategy = "EMERGENCY_EXIT"
-            dominant_regime = "CRISIS"
+            dominant_regime = "Crisis"
             regime_outputs = {}
             allowed_strategies = ["Defensive"]
             removed_strategies = ["ALL_OTHERS"]
             bandit_scores = {}
             per_stock_strategies = {t: "Defensive" for t in stock_data_dict.keys()}
             per_stock_details = {}
-            
-            # Position Sizing -> Force 0 (Cash)
-            position_sizes = pd.Series({t: 0.0 for t in stock_data_dict.keys()})
+            per_stock_participation = {t: 0.0 for t in stock_data_dict.keys()}
+
+            # Every ticker is marked "Defensive", so the sizing block below
+            # zeroes its target weight, which makes L8 emit SELL for every
+            # open position. No explicit position_sizes assignment is needed
+            # here — one used to exist and was silently overwritten by the
+            # unconditional sizing block further down.
+
             switch_decision = SwitchDecision(
-                should_switch=True, reason="Emergency Protocol", 
+                should_switch=True,
+                reason="Emergency Protocol",
                 current_strategy=self.current_strategy or "None",
-                new_strategy="EMERGENCY_EXIT", new_probability=1.0
-            ) 
-            strategy_decision = None # Special case
+                new_strategy="EMERGENCY_EXIT",
+                new_probability=1.0,
+            )
+
+            # L12 reads .selection_reason off this object unconditionally, so
+            # it must be a real object rather than None.
+            strategy_decision = type('StrategyDecision', (), {
+                'selected_strategy': selected_strategy,
+                'scores': {},
+                'bandit_score': 1.0,
+                'selection_reason': (
+                    f'Kill switch: drawdown {current_drawdown:.2%} exceeded '
+                    f'limit {self.policy.emergency_drawdown_threshold:.2%}'
+                ),
+                'expected_return': 0.0,
+                'alternatives': [],
+                'rationale': 'L0 emergency drawdown protocol (overrides L5)',
+            })()
+
+            # Suppress next-cycle bandit feedback. The liquidation was forced
+            # by L0 policy, not chosen by the bandits, so crediting or
+            # blaming any strategy arm for its outcome would corrupt the
+            # learned weights.
+            self.last_decisions = {}
+            self.last_per_stock_regimes = {}
+            self.last_regime = dominant_regime
             
         else:
             # ==== PRE-MARKET: PER-STOCK FLOW ====
@@ -183,6 +416,7 @@ class StrategyEngine:
             per_stock_strategies = {}
             per_stock_details = {}
             per_stock_allowed = {}
+            per_stock_participation = {}   # Ticker → capital participation [0, 1]
             regime_outputs = {}
             all_removed = set()
             
@@ -199,16 +433,21 @@ class StrategyEngine:
                 # === STEP 2: BANDIT A — Blend posteriors × GLOBAL trust ===
                 # Get GLOBAL trust weights (learned from all stocks)
                 bandit_a_weights = self.ensemble_bandits.global_bandit.get_trust_weights()
-                blended = blend_regime(hmm_posteriors, bandit_a_weights)
+                w_global, w_hmm = getattr(self, "blend_weights", (0.60, 0.40))
+                blended = blend_regime(
+                    hmm_posteriors, bandit_a_weights,
+                    w_global=w_global, w_hmm=w_hmm,
+                )
                 
                 dominant_regime = max(blended, key=blended.get)
                 hmm_confidence = max(blended.values())
                 stability = regime_output.stability_score if regime_output else 0.5
                 
                 # Confidence gate
-                is_ambiguous = hmm_confidence < 0.55
+                gate = getattr(self, "confidence_gate", 0.55)
+                is_ambiguous = hmm_confidence < gate
                 if is_ambiguous:
-                    print(f"  ⚠ {ticker}: Ambiguous regime (confidence={hmm_confidence:.2f} < 0.55)")
+                    print(f"  ⚠ {ticker}: Ambiguous regime (confidence={hmm_confidence:.2f} < {gate})")
                 
                 # Transition detection (per stock vs global last regime for now)
                 transition_flag = (
@@ -231,30 +470,47 @@ class StrategyEngine:
                 # === STEP 3: Load strategies for this stock's regime ===
                 allowed_strategies_for_regime = REGIME_STRATEGY_COMPAT.get(dominant_regime, ["Defensive"])
                 
-                try:
-                    strategy_outputs = run_strategies_for_regime(
-                        regime=dominant_regime,
-                        stock_data_dict={ticker: df},
-                    )
-                except Exception as e:
-                    print(f"⚠️ Strategy execution failed for {ticker} (regime={dominant_regime}): {e}")
-                    strategy_outputs = []
+                # "regime" = this regime's 10-strategy pod (default).
+                # "all"    = all 40 strategies, ignoring the regime gate.
+                if getattr(self, "strategy_pool", "regime") == "all":
+                    pool_regimes = ["Bull-Quiet", "Bull-Volatile", "Sideways", "Crisis"]
+                else:
+                    pool_regimes = [dominant_regime]
+
+                strategy_outputs = []
+                for pool_regime in pool_regimes:
+                    try:
+                        strategy_outputs.extend(run_strategies_for_regime(
+                            regime=pool_regime,
+                            stock_data_dict={ticker: df},
+                        ))
+                    except Exception as e:
+                        print(f"⚠️ Strategy execution failed for {ticker} (regime={pool_regime}): {e}")
                 
                 if not strategy_outputs:
                     per_stock_strategies[ticker] = "Defensive"
                     per_stock_details[ticker] = {"allowed": ["Defensive"], "scores": {}, "no_strategies": True, "regime": dominant_regime}
                     per_stock_allowed[ticker] = ["Defensive"]
+                    per_stock_participation[ticker] = 0.0
                     continue
-                
-                # Get strategy names from outputs
-                available_strategy_names = list(set(
-                    out.strategy_name for out in strategy_outputs if out.ticker == ticker
-                ))
-                
+
+                # Index this ticker's outputs by strategy name so the winner's
+                # signal/confidence can be recovered after ranking. These were
+                # previously discarded, which left strategy choice with no
+                # causal path to the portfolio.
+                outputs_by_name = {
+                    out.strategy_name: out
+                    for out in strategy_outputs
+                    if out.ticker == ticker
+                }
+
+                available_strategy_names = list(outputs_by_name.keys())
+
                 if not available_strategy_names:
                     per_stock_strategies[ticker] = "Defensive"
                     per_stock_details[ticker] = {"allowed": ["Defensive"], "scores": {}, "no_strategies": True, "regime": dominant_regime}
                     per_stock_allowed[ticker] = ["Defensive"]
+                    per_stock_participation[ticker] = 0.0
                     continue
                 
                 # === STEP 4: BANDIT B — Rank strategies in this GLOBAL regime ===
@@ -274,27 +530,28 @@ class StrategyEngine:
                 # Build per-strategy timeframe map from strategy specs
                 strategy_specs = get_strategies_for_regime(dominant_regime)
                 timeframe_map = {spec.name: spec.timeframe for spec in strategy_specs}
-                
+                spec_map = {spec.name: spec for spec in strategy_specs}
+
                 # Per-strategy past return using each strategy's own TIMEFRAME
+                past_mode = getattr(self, "past_return_mode", "strategy")
                 raw_scores = []
                 for strat_name, score_b in top_5_strategies:
                     tf = timeframe_map.get(strat_name, 30)  # fallback 30 days
-                    
-                    # Calculate risk-adjusted past return (Sharpe-like)
-                    risk_adj_return = 0.0
-                    if len(df) >= tf and "Close" in df.columns:
-                        closes = df["Close"].values[max(0, len(df) - tf):]
-                        if len(closes) > 1:
-                            daily_rets = np.diff(closes) / closes[:-1]
-                            mean_ret = np.mean(daily_rets)
-                            std_ret = np.std(daily_rets)
-                            if std_ret > 1e-6:
-                                # Annualized Sharpe-like ratio
-                                risk_adj_return = (mean_ret / std_ret) * np.sqrt(252)
-                    
+                    spec = spec_map.get(strat_name)
+
+                    # Risk-adjusted past return. "strategy" replays the
+                    # strategy's own signals; "stock" is the legacy term that
+                    # cannot separate strategies sharing a timeframe.
+                    if past_mode == "off" or spec is None:
+                        risk_adj_return = 0.0
+                    elif past_mode == "stock":
+                        risk_adj_return = self._stock_past_sharpe(df, tf)
+                    else:
+                        risk_adj_return = self._strategy_past_sharpe(spec, ticker, df, tf)
+
                     # Weight from Stock Bandit (θ_C) — per-stock-per-regime
                     theta_c = stock_bandit_mgr.sample(ticker, strat_name, regime=dominant_regime)
-                    
+
                     raw_scores.append({
                         "name": strat_name,
                         "theta_b": score_b,
@@ -305,14 +562,26 @@ class StrategyEngine:
                 # Normalize risk-adjusted returns to [0, 1] range for fair linear combination
                 rets = [s["risk_adj_ret"] for s in raw_scores]
                 min_ret, max_ret = min(rets), max(rets)
-                range_ret = max_ret - min_ret if max_ret > min_ret else 1.0
-                
+                spread_ret = max_ret - min_ret
+                # All candidates tied: the term carries no ranking information,
+                # so make it NEUTRAL. Mapping every candidate to 0.0 (the old
+                # behavior) silently zeroed out w_r of the score instead.
+                all_tied = spread_ret <= 1e-12
+
+                w_b, w_r, w_c = getattr(self, "score_weights", (0.3, 0.4, 0.3))
+                if past_mode == "off":
+                    # Redistribute the middle term's weight proportionally
+                    # rather than letting it shrink every candidate equally.
+                    bc_total = w_b + w_c
+                    if bc_total > 0:
+                        w_b, w_r, w_c = w_b / bc_total, 0.0, w_c / bc_total
+
                 stock_scored = []
                 for s in raw_scores:
-                    norm_ret = (s["risk_adj_ret"] - min_ret) / range_ret
-                    
-                    # Final Score = 30% θ_B + 40% Risk-Adj Return + 30% θ_C
-                    final_score = (0.3 * s["theta_b"]) + (0.4 * norm_ret) + (0.3 * s["theta_c"])
+                    norm_ret = 0.5 if all_tied else (s["risk_adj_ret"] - min_ret) / spread_ret
+
+                    # Final Score = w_b*θ_B + w_r*Risk-Adj Return + w_c*θ_C
+                    final_score = (w_b * s["theta_b"]) + (w_r * norm_ret) + (w_c * s["theta_c"])
                     
                     stock_scored.append((
                         s["name"], 
@@ -333,8 +602,36 @@ class StrategyEngine:
                     winner_name = "Defensive"
                     winner_final_score = 0.0
                     winner_theta_c = 0.5
-                
+
                 per_stock_strategies[ticker] = winner_name
+
+                # === STEP 6: Winner's directional view → capital participation ===
+                # This is where strategy selection becomes consequential: the
+                # chosen strategy's own signal and confidence scale the target
+                # weight in L7. A bearish winner exits the name to cash.
+                winner_output = outputs_by_name.get(winner_name)
+                if winner_output is not None:
+                    winner_signal = winner_output.signal
+                    winner_confidence = winner_output.confidence
+                else:
+                    # Winner not present in this ticker's outputs (e.g. the
+                    # "Defensive" fallback). Stay flat rather than guess.
+                    winner_signal = -1
+                    winner_confidence = 0.0
+
+                if getattr(self, "use_signal_participation", True):
+                    participation = signal_participation(winner_signal, winner_confidence)
+                else:
+                    # Ablation: strategy choice does not affect position size,
+                    # reproducing the engine's behavior before signals were wired in.
+                    participation = 1.0
+                per_stock_participation[ticker] = participation
+
+                print(
+                    f"     ↳ {ticker}: {winner_name} "
+                    f"signal={winner_signal:+d} conf={winner_confidence:.2f} "
+                    f"→ participation={participation:.2f}"
+                )
                 
                 # Build strategy_scores dict for UI (using Bandit B's base scores for the list)
                 strategy_scores = {s[0]: s[1] for s in top_5_strategies}
@@ -347,6 +644,9 @@ class StrategyEngine:
                     "hmm_confidence": hmm_confidence,
                     "regime": dominant_regime,
                     "winner_theta_c": winner_theta_c,
+                    "winner_signal": winner_signal,
+                    "winner_confidence": winner_confidence,
+                    "participation": participation,
                     "all_bandit_b_weights": {k: round(v, 4) for k, v in all_bandit_b_weights.items()},
                     "candidates": [
                         {
@@ -377,6 +677,18 @@ class StrategyEngine:
             # Save decisions for post-trade feedback (include per-stock regimes)
             self.last_decisions = per_stock_strategies.copy()
             self.last_per_stock_regimes = {t: info["dominant_regime"] for t, info in regime_outputs.items()}
+            # Capture what the strategy actually decided and the price it
+            # decided at, so next cycle can compute a reward attributable to
+            # THIS strategy rather than to the asset's raw drift.
+            self.last_participation = dict(per_stock_participation)
+            self.last_ambiguous = {
+                t: bool(info.get("is_ambiguous", False))
+                for t, info in regime_outputs.items()
+            }
+            try:
+                self.last_prices = snapshot_prices(stock_data_dict, current_date_str)
+            except Exception:
+                self.last_prices = {}
             
             # Persist bandit state after every run
             self.ensemble_bandits.save_all()
@@ -443,15 +755,31 @@ class StrategyEngine:
                 if ticker in sizing_weights.index:
                     sizing_weights[ticker] = 0.0
 
+        # Winner's signal x confidence, per ticker. Missing entries default to
+        # 1.0 (no conviction adjustment) rather than 0, so a ticker that never
+        # reached strategy selection is not silently liquidated.
+        participation_series = pd.Series({
+            t: per_stock_participation.get(t, 1.0)
+            for t in sizing_weights.index
+        })
+
+        # Size against total equity (cash + holdings), not cash alone. Using
+        # cash made Capital_Allocation collapse to ~0 after the first cycle,
+        # since the book is close to fully invested by then.
+        equity_snapshot = snapshot_prices(stock_data_dict, current_date_str)
+        sizing_capital = self.portfolio_state.current_equity(equity_snapshot)
+
         position_sizes = compute_position_sizes(
             user_weights=sizing_weights,
             forecast_vol=forecast_vol,
-            total_capital=self.portfolio_state.cash,
+            total_capital=sizing_capital,
             stability_scores=stability_series,
+            participation=participation_series,
             target_vol=0.15,
             max_vol=risk_limits["max_volatility"],
             max_dd=risk_limits["max_drawdown"],
             max_leverage=risk_limits["max_leverage"],
+            fully_invested=getattr(self, "fully_invested", False),
         )
         
         # === 8. SIGNAL GENERATION ===
@@ -461,14 +789,18 @@ class StrategyEngine:
                 "Ticker": position_sizes.index.tolist(),
                 "Weight": position_sizes.values.tolist()
             })
+        elif position_sizes is None or position_sizes.empty:
+            new_portfolio_df = pd.DataFrame(columns=["Ticker", "Weight"])
         else:
-            new_portfolio_df = position_sizes.reset_index()
-            if len(new_portfolio_df.columns) == 2:
-                new_portfolio_df.columns = ["Ticker", "Weight"]
-            else:
-                # Handle multi-column case: first col is ticker, last is weight
-                new_portfolio_df = new_portfolio_df.iloc[:, [0, -1]]
-                new_portfolio_df.columns = ["Ticker", "Weight"]
+            # Select columns by NAME. The previous positional slice took the
+            # last column — Capital_Allocation, denominated in dollars — as
+            # "Weight". That only produced sane numbers because L8 then
+            # renormalized the column back into fractions, which also silently
+            # cancelled the volatility and leverage caps.
+            new_portfolio_df = pd.DataFrame({
+                "Ticker": position_sizes["Ticker"].tolist(),
+                "Weight": position_sizes["Adjusted_Weight"].tolist(),
+            })
         
         # Get old strategies from portfolio state (tracks which strategy was used for each position)
         old_strategies = dict(self.portfolio_state.position_strategies)
@@ -483,7 +815,8 @@ class StrategyEngine:
         )
         
         # Log signals to persistent CSV
-        log_signals(signals)
+        if getattr(self, "logging_enabled", True):
+            log_signals(signals)
         
         # === 9. EXECUTION SCHEDULER ===
         switch_decision = self.switch_manager.evaluate_switch(
@@ -497,18 +830,26 @@ class StrategyEngine:
         # === 10. TRADE EXECUTION ===
         # Signal generation uses Day T closing prices
         # Trade execution happens on Day T+1 opening prices
-        execution_date_str = get_next_trading_day(current_date_str)
+        # Prefer an explicitly supplied execution date. A rule-based holiday
+        # calendar cannot know about ad-hoc closures (Hurricane Sandy, funeral
+        # closures) or observed-holiday shifts where the NYSE traded anyway
+        # (2010-12-31, Juneteenth 2021) — nine such days between 2005 and
+        # 2025. When the caller knows which bars actually exist, it should say
+        # so; guessing wrong meant asking for a bar that was not in the
+        # execution slice and filling at a stale price.
+        execution_date_str = execution_date or get_next_trading_day(current_date_str)
         
         execution_report = {}
         if not signals.empty:
             try:
                 execution_report = run_execution_cycle(
                     state=self.portfolio_state,
-                    price_data_dict=stock_data_dict,
+                    price_data_dict=execution_data_dict,  # includes the T+1 bar
                     signals_df=signals,
                     new_portfolio_weights=new_portfolio_df,
                     date=execution_date_str,  # T+1 execution date
-                    commission_per_trade=1.0,
+                    commission_per_trade=commission_per_trade,
+                    cost_bps=cost_bps,
                 )
                 
                 # Get current prices for transaction logging and P/L calculation
@@ -528,38 +869,40 @@ class StrategyEngine:
                 
                 # Log detailed transactions from actual fills (includes BUY + SELL)
                 fills_df = execution_report.get("fills")
-                if fills_df is not None and not fills_df.empty:
-                    log_transactions_from_fills(
-                        fills_df=fills_df,
-                        execution_date=execution_date_str,  # T+1 execution date
-                    )
-                
+                if getattr(self, "logging_enabled", True):
+                    if fills_df is not None and not fills_df.empty:
+                        log_transactions_from_fills(
+                            fills_df=fills_df,
+                            execution_date=execution_date_str,  # T+1 execution date
+                        )
+
                 # Log cycle summary with actual P/L values
-                cycle_num = get_latest_cycle_number() + 1
-                
+                cycle_num = get_latest_cycle_number() + 1 if getattr(self, "logging_enabled", True) else 0
+
                 # Count positions with non-zero qty
                 num_positions = len(self.portfolio_state.positions)
-                
+
                 # Extract marginal fees from this execution only
                 fees_this_cycle = 0.0
                 if execution_report and "fees_paid" in execution_report:
                     fees_this_cycle = execution_report["fees_paid"]
 
-                log_cycle_summary(
-                    execution_date=execution_date_str,  # T+1 execution date
-                    rebalance_frequency=self.policy.rebalance_frequency,
-                    portfolio_value=portfolio_value,
-                    cash=self.portfolio_state.cash,
-                    initial_capital=self.policy.total_capital,  # Pass strict initial capital
-                    pnl=pnl,
-                    return_pct=return_pct,
-                    cycle_number=cycle_num,
-                    realized_pnl=realized_pnl,
-                    unrealized_pnl=unrealized_pnl,
-                    cumulative_realized_pnl=realized_pnl,
-                    transaction_costs=fees_this_cycle,  # Log MARGINAL fees, not cumulative
-                    num_positions=num_positions,
-                )
+                if getattr(self, "logging_enabled", True):
+                    log_cycle_summary(
+                        execution_date=execution_date_str,  # T+1 execution date
+                        rebalance_frequency=self.policy.rebalance_frequency,
+                        portfolio_value=portfolio_value,
+                        cash=self.portfolio_state.cash,
+                        initial_capital=self.policy.total_capital,
+                        pnl=pnl,
+                        return_pct=return_pct,
+                        cycle_number=cycle_num,
+                        realized_pnl=realized_pnl,
+                        unrealized_pnl=unrealized_pnl,
+                        cumulative_realized_pnl=realized_pnl,
+                        transaction_costs=fees_this_cycle,  # MARGINAL, not cumulative
+                        num_positions=num_positions,
+                    )
             except Exception as e:
                 execution_report = {"error": str(e), "signals": signals.to_dict()}
         
@@ -605,6 +948,7 @@ class StrategyEngine:
             portfolio_state=self.portfolio_state.get_summary(),
             execution_time_ms=elapsed_ms,
             switch_decision=switch_decision,
+            emergency_triggered=emergency_triggered,
         )
 
     def _infer_tolerance(self, limits: dict) -> str:
@@ -662,27 +1006,55 @@ class StrategyEngine:
             df = enriched_data[ticker]
             if df.empty:
                 continue
-            
+
             # Use this stock's regime (fallback to global)
             regime = per_stock_regimes.get(ticker, self.last_regime or "Sideways")
-            
-            qty = self.portfolio_state.positions.get(ticker, 0)
-            
-            if "Returns" in df.columns:
-                daily_return = df["Returns"].iloc[-1] if abs(qty) > 0 else 0.0
-            elif "Return_1D" in df.columns:
-                daily_return = df["Return_1D"].iloc[-1] if abs(qty) > 0 else 0.0
+
+            # === 1. Realized asset move over the ACTUAL holding period ===
+            # Previously this was a single day's return regardless of the
+            # rebalance interval, so a week-long position was graded on its
+            # last day.
+            entry_price = self.last_prices.get(ticker)
+            current_price = None
+            if "Close" in df.columns and len(df):
+                current_price = float(df["Close"].iloc[-1])
+
+            if entry_price and current_price and entry_price > 0:
+                asset_return = (current_price - entry_price) / entry_price
             else:
-                daily_return = 0.0
-            
+                # No usable entry reference — fall back to one day.
+                for col in ("Returns", "Return_1D"):
+                    if col in df.columns:
+                        asset_return = float(df[col].iloc[-1])
+                        break
+                else:
+                    asset_return = 0.0
+
+            # === 2. Attribute the move to the STRATEGY, not the asset ===
+            # Credit the deviation from a neutral stance. Feeding the raw
+            # asset return gave every candidate strategy the same reward,
+            # so the bandits could not learn which one was responsible.
+            participation = self.last_participation.get(ticker, 0.5)
+            r_attr = attributable_return(participation, asset_return)
+
+            # === 3. Risk-adjust (paper Eq. 7) ===
+            # compute_reward was imported but never called; raw returns went
+            # straight to the bandits with no outlier dampening.
+            vol_60d = 0.15
             if "Realized_Vol" in df.columns:
-                vol_60d = df["Realized_Vol"].iloc[-1]
-            else:
-                vol_60d = 0.15
-            
-            # Using actual raw return for new feedback setup
-            rewards = {"A": daily_return, "B": daily_return, "C": daily_return}
-            
+                v = df["Realized_Vol"].iloc[-1]
+                if np.isfinite(v) and v > 0:
+                    vol_60d = float(v)
+
+            r_final = compute_reward(r_attr, vol_60d)
+
+            # === 4. Differentiate per bandit level (paper Sec VI-E) ===
+            # Signed rewards — EXP3 needs the sign so losing arms decay.
+            rewards = differentiated_exp3_rewards(
+                r_final,
+                is_ambiguous=self.last_ambiguous.get(ticker, False),
+            )
+
             # Update arms for THIS ticker
             # Note: persistence.update_arm handles the global/local routing
             self.ensemble_bandits.update_arm(

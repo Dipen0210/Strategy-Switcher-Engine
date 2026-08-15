@@ -1,0 +1,2 @@
+point,lower,upper,n,n_boot,mean_block,method
+0.9771535049444796,0.44428947254318985,1.564649666081061,2764,10000,21.0,stationary bootstrap (Politis-Romano)

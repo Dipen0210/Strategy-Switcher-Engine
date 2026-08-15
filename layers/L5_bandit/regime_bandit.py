@@ -47,6 +47,9 @@ class RegimeBandit:
     """
     regime: str
     strategies: dict[str, float] = field(default_factory=dict)
+    # Sensitivity-sweep knobs; see GlobalBandit.decay_factor.
+    decay_factor: float = DECAY_FACTOR
+    epsilon: float = EPSILON
 
     def _ensure_strategies(self, strategy_names: list[str]) -> None:
         """Ensure all strategies are initialized."""
@@ -95,7 +98,7 @@ class RegimeBandit:
         
         # ε-greedy: with probability EPSILON, swap the weakest in top 5
         # with a random strategy from the remaining pool
-        if remaining and random.random() < EPSILON:
+        if remaining and random.random() < getattr(self, "epsilon", EPSILON):
             explore_pick = random.choice(remaining)
             top_5[-1] = explore_pick  # Replace weakest with random explore
         
@@ -114,7 +117,8 @@ class RegimeBandit:
         
         for k in self.strategies:
             current = self.strategies[k]
-            self.strategies[k] = (current * DECAY_FACTOR) + (uniform_weight * (1.0 - DECAY_FACTOR))
+            delta = getattr(self, "decay_factor", DECAY_FACTOR)
+            self.strategies[k] = (current * delta) + (uniform_weight * (1.0 - delta))
             
         self._normalize()
 
@@ -149,6 +153,28 @@ class RegimeBanditManager:
     def __init__(self, save_dir: Optional[Path] = None):
         self.save_dir = save_dir or Path(".")
         self.bandits: dict[str, RegimeBandit] = {}
+        # Sensitivity-sweep overrides. None -> use the module defaults. Set
+        # via set_hyperparameters so bandits created or loaded LATER inherit
+        # them too; stamping only the existing ones silently left half the
+        # sweep running at the default value.
+        self.decay_factor: Optional[float] = None
+        self.epsilon: Optional[float] = None
+
+    def set_hyperparameters(self, decay_factor: Optional[float] = None,
+                            epsilon: Optional[float] = None) -> None:
+        if decay_factor is not None:
+            self.decay_factor = float(decay_factor)
+        if epsilon is not None:
+            self.epsilon = float(epsilon)
+        for bandit in self.bandits.values():
+            self._stamp(bandit)
+
+    def _stamp(self, bandit: RegimeBandit) -> RegimeBandit:
+        if self.decay_factor is not None:
+            bandit.decay_factor = self.decay_factor
+        if self.epsilon is not None:
+            bandit.epsilon = self.epsilon
+        return bandit
 
     def get_bandit(self, regime: str) -> RegimeBandit:
         """Get or create the bandit for a specific regime."""
@@ -157,7 +183,7 @@ class RegimeBanditManager:
         if normalized_regime not in self.bandits:
             self.bandits[normalized_regime] = RegimeBandit(regime=normalized_regime)
 
-        return self.bandits[normalized_regime]
+        return self._stamp(self.bandits[normalized_regime])
 
     def rank_strategies(self, regime: str, strategy_names: list[str]) -> list[tuple[str, float]]:
         return self.get_bandit(regime).rank_strategies(strategy_names)

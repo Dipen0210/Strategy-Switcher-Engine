@@ -1,0 +1,4 @@
+engine_vs,sharpe_engine,sharpe_benchmark,difference,std_error,p_value,n_days
+buy_and_hold,0.9772,1.25,-0.2729,0.2765,0.2967,2764
+static_40,0.9772,1.3664,-0.3893,0.1095,0.0008,2764
+benchmark_spx,0.9772,0.8062,0.171,0.232,0.4371,2764

@@ -39,6 +39,9 @@ class GlobalBandit:
     Uses EXP3 multiplicative weight updates for stable learning.
     """
     regime_weights: dict[str, float] = field(default_factory=dict)
+    # Sensitivity-sweep knob. Instance-level so a run can vary delta
+    # without mutating module state shared by other runs in the process.
+    decay_factor: float = DECAY_FACTOR
 
     def __post_init__(self):
         if not self.regime_weights:
@@ -98,7 +101,8 @@ class GlobalBandit:
         for k in self.regime_weights:
             # Pull current weight towards the uniform weight by the decay factor
             current = self.regime_weights[k]
-            self.regime_weights[k] = (current * DECAY_FACTOR) + (uniform_weight * (1.0 - DECAY_FACTOR))
+            delta = getattr(self, "decay_factor", DECAY_FACTOR)
+            self.regime_weights[k] = (current * delta) + (uniform_weight * (1.0 - delta))
             
         self._normalize()
 

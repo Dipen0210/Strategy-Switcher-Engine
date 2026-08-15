@@ -4,10 +4,12 @@ from layers.L7_position_sizing.weight_optimizer import (
     volatility_adjusted_sizing,
     compute_position_sizes,
     mean_variance_optimize,
+    signal_participation,
 )
 
 __all__ = [
     "volatility_adjusted_sizing",
     "compute_position_sizes",
     "mean_variance_optimize",
+    "signal_participation",
 ]

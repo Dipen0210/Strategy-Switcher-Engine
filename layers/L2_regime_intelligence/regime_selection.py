@@ -25,6 +25,15 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from layers.L2_regime_intelligence.features import (
+    HMM_FEATURE_COLUMNS,
+    FEATURE_SCHEMA_VERSION,
+    build_hmm_features,
+    fit_normalization,
+    apply_normalization,
+)
+from layers.L2_regime_intelligence.regime_labels import derive_state_labels
+
 
 # Regime names for interpretation
 REGIME_NAMES = {
@@ -169,63 +178,34 @@ class RegimeDetector:
         self.is_fitted = False
         self._feature_means = None
         self._feature_stds = None
+        # Derived at fit time: {state_index: regime_name}. Falls back to the
+        # legacy positional map only if a model carries no mapping.
+        self.state_labels: Optional[dict] = None
     
     def _prepare_features(self, df: pd.DataFrame) -> np.ndarray:
         """
         Prepare feature matrix for HMM.
-        
-        Uses:
-        - Log returns
-        - Realized volatility
-        - MA slope (trend direction)
+
+        Delegates to the canonical builder in features.py so that training
+        and inference cannot drift apart (they previously did, on two of
+        three columns). See that module for the feature contract.
         """
-        features = []
-        
-        # Log returns
-        if "Return_1D" in df.columns:
-            returns = df["Return_1D"].values
-        else:
-            returns = np.log(df["Close"] / df["Close"].shift(1)).values
-        features.append(returns)
-        
-        # Volatility (Prioritize GARCH > Realized > Calculated)
-        if "GARCH_Vol" in df.columns:
-            vol = df["GARCH_Vol"].values
-        elif "Realized_Vol" in df.columns:
-            vol = df["Realized_Vol"].values
-        else:
-            log_ret = np.log(df["Close"] / df["Close"].shift(1))
-            vol = log_ret.rolling(window=20).std().values * np.sqrt(252)
-        features.append(vol)
-        
-        # Trend indicator (MA slope)
-        if "MA_Slope" in df.columns:
-            trend = df["MA_Slope"].values
-        else:
-            ma = df["Close"].rolling(window=20).mean()
-            trend = ((ma - ma.shift(5)) / ma.shift(5)).values
-        features.append(trend)
-        
-        # Stack and handle NaN
-        X = np.column_stack(features)
-        
-        # Remove rows with NaN
-        valid_mask = ~np.isnan(X).any(axis=1)
-        X = X[valid_mask]
-        
-        return X
-    
+        return build_hmm_features(df)
+
     def _normalize_features(self, X: np.ndarray, fit: bool = False) -> np.ndarray:
-        """Normalize features for numerical stability."""
+        """
+        Standardize features.
+
+        With fit=True the statistics come from X itself (training only).
+        With fit=False the statistics fitted at training time are reused, so
+        inference never standardizes using moments of the data it is scoring.
+        """
         if fit:
-            self._feature_means = np.nanmean(X, axis=0)
-            self._feature_stds = np.nanstd(X, axis=0)
-            self._feature_stds[self._feature_stds == 0] = 1.0
-        
-        if self._feature_means is None:
-            return X
-        
-        return (X - self._feature_means) / self._feature_stds
+            stats = fit_normalization(X)
+            self._feature_means = stats["means"]
+            self._feature_stds = stats["stds"]
+
+        return apply_normalization(X, self._feature_means, self._feature_stds)
     
     def fit(self, df: pd.DataFrame) -> "RegimeDetector":
         """
@@ -259,7 +239,12 @@ class RegimeDetector:
             
             self.model.fit(X_norm)
             self.is_fitted = True
-            
+
+            # Resolve label switching immediately: EM's state numbering is
+            # arbitrary, so derive names from each state's return moments.
+            self.state_labels = derive_state_labels(self.model)
+
+
         except ImportError:
             # hmmlearn not installed, use simple rule-based fallback
             self._use_fallback = True
@@ -267,6 +252,17 @@ class RegimeDetector:
         
         return self
     
+    def _label_for(self, state_idx: int) -> str:
+        """
+        Canonical regime name for a raw HMM state index.
+
+        Uses the mapping derived at fit time. Falls back to the legacy
+        positional map only for models that predate deterministic sorting.
+        """
+        if self.state_labels:
+            return self.state_labels.get(state_idx, REGIME_NAMES.get(state_idx, "Sideways"))
+        return REGIME_NAMES.get(state_idx, "Sideways")
+
     def predict_regime(self, df: pd.DataFrame) -> RegimeOutput:
         """
         Predict current regime probabilities.
@@ -304,12 +300,13 @@ class RegimeDetector:
             # Get probabilities for the latest observation
             latest_probs = posteriors[-1]
             
-            # Map to regime names
-            probs = {REGIME_NAMES[i]: float(latest_probs[i]) for i in range(self.n_states)}
-            
+            # Map to regime names via the model's own derived mapping, NOT a
+            # positional assumption about EM's arbitrary state numbering.
+            probs = {self._label_for(i): float(latest_probs[i]) for i in range(self.n_states)}
+
             # Find dominant regime
-            dominant_idx = np.argmax(latest_probs)
-            dominant_regime = REGIME_NAMES[dominant_idx]
+            dominant_idx = int(np.argmax(latest_probs))
+            dominant_regime = self._label_for(dominant_idx)
             
             # Get allowed strategies
             allowed = REGIME_STRATEGY_COMPAT.get(dominant_regime, ["Defensive"])
@@ -415,9 +412,16 @@ class RegimeDetector:
             "feature_means": self._feature_means,
             "feature_stds": self._feature_stds,
             "model": self.model,
-            "use_fallback": getattr(self, "_use_fallback", False)
+            "use_fallback": getattr(self, "_use_fallback", False),
+            # Feature contract — validated on load so a model trained against
+            # a different feature set fails loudly instead of silently
+            # producing meaningless posteriors.
+            "feature_columns": list(HMM_FEATURE_COLUMNS),
+            "feature_schema_version": FEATURE_SCHEMA_VERSION,
+            # Deterministic state -> regime mapping (label-switching fix).
+            "state_labels": self.state_labels,
         }
-        
+
         with open(path, "wb") as f:
             pickle.dump(state, f)
     
@@ -430,7 +434,22 @@ class RegimeDetector:
         
         with open(path, "rb") as f:
             state = pickle.load(f)
-        
+
+        # --- Feature contract validation ---------------------------------
+        # Models saved before the shared feature module was introduced carry
+        # no schema stamp and were fitted on a DIFFERENT feature set than the
+        # one served at inference. Refuse them rather than scoring garbage.
+        saved_schema = state.get("feature_schema_version")
+        saved_columns = state.get("feature_columns")
+
+        if saved_schema != FEATURE_SCHEMA_VERSION or saved_columns != list(HMM_FEATURE_COLUMNS):
+            raise ValueError(
+                f"HMM at {path} was trained against feature schema "
+                f"{saved_schema!r} {saved_columns!r}, but this build expects "
+                f"{FEATURE_SCHEMA_VERSION!r} {list(HMM_FEATURE_COLUMNS)!r}. "
+                "Retrain with: python layers/L2_regime_intelligence/train_hmm.py"
+            )
+
         self.n_states = state["n_states"]
         self.random_state = state["random_state"]
         self.is_fitted = state["is_fitted"]
@@ -438,7 +457,14 @@ class RegimeDetector:
         self._feature_stds = state["feature_stds"]
         self.model = state["model"]
         self._use_fallback = state.get("use_fallback", False)
-        
+
+        # Deterministic state -> regime mapping. If a model somehow lacks one,
+        # derive it now rather than silently falling back to the positional
+        # assumption that label switching invalidates.
+        self.state_labels = state.get("state_labels")
+        if not self.state_labels and self.model is not None:
+            self.state_labels = derive_state_labels(self.model)
+
         return self
 
 

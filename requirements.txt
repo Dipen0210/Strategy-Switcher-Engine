@@ -23,5 +23,8 @@ pyyaml
 hmmlearn>=0.3.0    # Gaussian HMM for regime detection
 arch>=6.0          # GARCH volatility modeling
 
+# Backtest harness
+pyarrow            # parquet cache for point-in-time market data
+
 # Testing
 pytest>=7.0.0

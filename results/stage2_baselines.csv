@@ -1,0 +1,4 @@
+Strategy,CAGR,Vol,Sharpe,MaxDD,Calmar,WinRate,Turnover,InMkt
+buy_and_hold,49.21%,37.79%,1.25,-59.36%,0.83,55.2%,1.012,100.0%
+static_40,7.83%,5.64%,1.37,-8.76%,0.89,55.9%,0.104,43.9%
+benchmark_spx,13.57%,17.79%,0.81,-33.72%,0.40,54.8%,1.012,100.0%

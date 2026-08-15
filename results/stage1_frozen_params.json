@@ -1,0 +1,12 @@
+{
+  "best_params": {
+    "fully_invested": "True",
+    "past_return_mode": "off"
+  },
+  "n_trials": 6,
+  "dev_window": [
+    "2005-01-01",
+    "2014-12-31"
+  ],
+  "note": "FROZEN before the evaluation window was opened"
+}

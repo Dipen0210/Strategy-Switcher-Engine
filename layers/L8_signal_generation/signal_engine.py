@@ -70,12 +70,15 @@ def _prepare_portfolio(df: pd.DataFrame | None, strategy_col: str = "Strategy") 
         .groupby("Ticker", as_index=False, sort=False)
         .last()
     )
-    
-    # Normalize weights
-    total = working["Weight"].sum()
-    if total > 0:
-        working["Weight"] = working["Weight"] / total
-    
+
+    # Weights are ABSOLUTE fractions of equity and are deliberately NOT
+    # renormalized to sum to 1.0. A book that L7 sized to 0.70 gross has 30%
+    # in cash, and that is the intended state — renormalizing here would
+    # silently restore full investment and cancel both the conviction
+    # scaling and the volatility/leverage caps applied upstream.
+    # Old and new portfolios are expressed in the same units, so they stay
+    # directly comparable.
+
     return working[["Ticker", "Weight", "Strategy"]]
 
 

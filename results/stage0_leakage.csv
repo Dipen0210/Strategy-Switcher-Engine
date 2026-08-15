@@ -1,0 +1,5 @@
+test,passed,checked,violations
+decision_slices_truncated,True,207.0,
+folds_trained_before_use,True,207.0,
+execution_uses_next_open,True,1339.0,
+future_perturbation,True,,

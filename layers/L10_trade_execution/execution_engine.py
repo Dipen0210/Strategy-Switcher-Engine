@@ -192,10 +192,20 @@ def execute_orders(
     prices: Dict[str, float],
     date: Optional[str] = None,
     commission_per_trade: float = 1.0,
+    cost_bps: float = 0.0,
 ) -> pd.DataFrame:
     """
     Fill all orders at the execution-day price and update portfolio accounting.
     Updates position_strategies for new/changed positions.
+
+    Cost model:
+        fee = commission_per_trade + notional * cost_bps / 10_000
+
+    The flat commission represents a fixed broker charge; cost_bps is a
+    proportional bid-ask/slippage proxy. NOTE this is still a STATIC cost
+    assumption — real slippage expands non-linearly when liquidity thins, so
+    results should be reported across a range of cost_bps rather than at a
+    single point estimate.
     """
     if orders_df is None or orders_df.empty:
         return pd.DataFrame()
@@ -214,19 +224,24 @@ def execute_orders(
         if price is None or np.isnan(price) or price <= 0 or qty <= 0:
             continue
 
-        fee = commission_per_trade if commission_per_trade > 0 else 0.0
+        commission = commission_per_trade if commission_per_trade > 0 else 0.0
+        bps_rate = max(cost_bps, 0.0) / 10_000.0
 
         if side == "BUY":
-            available_cash = state.cash - fee
+            available_cash = state.cash - commission
             if available_cash <= 0:
                 continue
-            max_affordable = available_cash / price
+            # Cash must cover notional AND the proportional cost on it, so
+            # solve qty * price * (1 + bps) <= available_cash.
+            max_affordable = available_cash / (price * (1.0 + bps_rate))
             max_affordable = _truncate_value(max_affordable, decimals=4)
             if max_affordable <= 0:
                 continue
             qty = min(qty, max_affordable)
             if qty <= 0:
                 continue
+
+        fee = commission + (qty * price * bps_rate)
 
         qty_delta = qty if side == "BUY" else -qty
         realized = state.update_position(ticker, qty_delta, price=price, side=side)
@@ -267,6 +282,7 @@ def run_execution_cycle(
     new_portfolio_weights: pd.DataFrame,
     date: Optional[str] = None,
     commission_per_trade: float = 1.0,
+    cost_bps: float = 0.0,
 ) -> Dict:
     """
     Execute a full strategy-aware rebalance using signals.
@@ -307,6 +323,7 @@ def run_execution_cycle(
         prices=open_prices,
         date=str(date),
         commission_per_trade=commission_per_trade,
+        cost_bps=cost_bps,
     )
 
     state.mark_to_market(date, open_prices)

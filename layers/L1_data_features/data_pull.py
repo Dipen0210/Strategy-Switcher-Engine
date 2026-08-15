@@ -244,26 +244,34 @@ def compute_momentum(df: pd.DataFrame, period: int = 20) -> pd.DataFrame:
     return result
 
 
-def compute_all_features(df: pd.DataFrame) -> pd.DataFrame:
+def compute_all_features(df: pd.DataFrame, use_garch: bool = True) -> pd.DataFrame:
     """
     Compute all features for a single asset.
-    
+
     Input: DataFrame with OHLCV columns (Date optional as index or column)
     Output: DataFrame with all feature columns added
+
+    Args:
+        use_garch: fit GARCH(1,1) for the volatility forecast. This is by far
+            the most expensive feature and dominates backtest runtime (one fit
+            per ticker per rebalance). Set False to fall back to realized
+            volatility — used by the backtest harness, where thousands of
+            cycles x seeds x ablations make repeated GARCH fitting impractical.
     """
     if df.empty or len(df) < 30:
         return df
-    
+
     result = df.copy()
-    
+
     # Ensure sorted by date
     if "Date" in result.columns:
         result = result.sort_values("Date").reset_index(drop=True)
-    
+
     # Core features
     result = compute_returns(result, periods=[1, 5, 20])
     result = compute_realized_volatility(result, window=20)
-    result = compute_garch_volatility(result)
+    if use_garch:
+        result = compute_garch_volatility(result)
     result = compute_trend_indicators(result)
     result = compute_autocorrelation(result, lags=[1, 5, 10])
     result = compute_drawdown(result)
